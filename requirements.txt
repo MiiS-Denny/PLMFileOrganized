@@ -1,4 +1,5 @@
 streamlit
 pypdf
-requests
-pandas
+pdf2image
+pytesseract
+Pillow
