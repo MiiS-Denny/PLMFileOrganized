@@ -10,7 +10,10 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+import pytesseract
+
 from pypdf import PdfReader, PdfWriter
+from pdf2image import convert_from_path
 
 
 # ============================================================
@@ -18,7 +21,7 @@ from pypdf import PdfReader, PdfWriter
 # ============================================================
 
 APP_NAME = "PLM PDF Automation Tool"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.5.0"
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
@@ -37,6 +40,7 @@ st.set_page_config(
 st.markdown(
     """
     <style>
+
     .block-container {
         max-width: 1200px;
         padding-top: 1.8rem;
@@ -59,6 +63,7 @@ st.markdown(
         border-radius: 6px;
         padding: 12px;
     }
+
     </style>
     """,
     unsafe_allow_html=True,
@@ -70,11 +75,22 @@ st.markdown(
 # ============================================================
 
 DEFAULT_SESSION = {
+
     "authenticated": False,
     "username": None,
+
+    # Analysis
+    "analysis_done": False,
+    "analysis_matches": [],
+    "analysis_errors": [],
+    "analysis_word_count": 0,
+    "analysis_cover_count": 0,
+
+    # Output
     "result_files": [],
     "result_zip": None,
     "result_zip_name": None,
+
     "last_success": 0,
     "last_failed": 0,
     "last_total": 0,
@@ -82,7 +98,9 @@ DEFAULT_SESSION = {
 
 
 for key, value in DEFAULT_SESSION.items():
+
     if key not in st.session_state:
+
         st.session_state[key] = value
 
 
@@ -93,33 +111,53 @@ for key, value in DEFAULT_SESSION.items():
 def get_user_db():
 
     try:
+
         users = st.secrets["users"]
 
         result = {}
 
         for username, data in users.items():
+
             result[username] = {
-                "password": str(data["password"]).strip()
+                "password": str(
+                    data["password"]
+                ).strip()
             }
 
         return result
 
     except Exception as e:
-        st.error("無法讀取使用者設定。")
-        st.code(str(e))
+
+        st.error(
+            "無法讀取使用者設定。"
+        )
+
+        st.code(
+            str(e)
+        )
+
         st.stop()
 
 
 USER_DB = get_user_db()
 
 
-def verify_password(username, password):
+def verify_password(
+    username,
+    password
+):
 
     if username not in USER_DB:
+
         return False
 
-    expected = USER_DB[username]["password"]
-    entered = str(password).strip()
+    expected = (
+        USER_DB[username]["password"]
+    )
+
+    entered = str(
+        password
+    ).strip()
 
     return hmac.compare_digest(
         entered,
@@ -132,16 +170,35 @@ def verify_password(username, password):
 # ============================================================
 
 DOC_PATTERNS = [
-    r"\bDOC[-\s_]?(\d{4})[-\s_]?(\d{5})\b",
+
+    # DOC-2026-00491
+    # DOC 2026 00491
+    # DOC_2026_00491
+    # D O C - 2026 - 00491
+
+    r"D\s*O\s*C\s*[-_\s:]*([0-9]{4})\s*[-_\s:]*([0-9]{4,6})",
 ]
 
 
-def normalize_document_number(text):
+def normalize_document_number(
+    text
+):
 
     if not text:
+
         return None
 
     text = text.upper()
+
+    text = text.replace(
+        "\u00a0",
+        " "
+    )
+
+    text = text.replace(
+        "\u3000",
+        " "
+    )
 
     for pattern in DOC_PATTERNS:
 
@@ -156,7 +213,9 @@ def normalize_document_number(text):
             year = match.group(1)
             number = match.group(2)
 
-            return f"DOC-{year}-{number}"
+            return (
+                f"DOC-{year}-{number}"
+            )
 
     return None
 
@@ -165,7 +224,10 @@ def normalize_document_number(text):
 # PDF TEXT EXTRACTION
 # ============================================================
 
-def extract_pdf_text(pdf_path, max_pages=3):
+def extract_pdf_text(
+    pdf_path,
+    max_pages=3
+):
 
     reader = PdfReader(
         str(pdf_path)
@@ -178,7 +240,9 @@ def extract_pdf_text(pdf_path, max_pages=3):
         max_pages
     )
 
-    for i in range(page_count):
+    for i in range(
+        page_count
+    ):
 
         try:
 
@@ -188,24 +252,161 @@ def extract_pdf_text(pdf_path, max_pages=3):
                 or ""
             )
 
-            text_parts.append(text)
+            text_parts.append(
+                text
+            )
 
         except Exception:
+
             pass
 
-    return "\n".join(text_parts)
+    return "\n".join(
+        text_parts
+    )
 
 
-def detect_doc_number_from_pdf(pdf_path):
+# ============================================================
+# OCR
+# ============================================================
 
-    text = extract_pdf_text(
+def extract_pdf_text_ocr(
+    pdf_path
+):
+
+    images = convert_from_path(
+        str(pdf_path),
+        dpi=300,
+        first_page=1,
+        last_page=1,
+        fmt="png",
+        thread_count=1,
+    )
+
+    if not images:
+
+        return ""
+
+    image = images[0]
+
+
+    # --------------------------------------------------------
+    # OCR PASS 1
+    # --------------------------------------------------------
+
+    text1 = pytesseract.image_to_string(
+        image,
+        lang="eng",
+        config="--psm 6"
+    )
+
+
+    if normalize_document_number(
+        text1
+    ):
+
+        return text1
+
+
+    # --------------------------------------------------------
+    # OCR PASS 2
+    # --------------------------------------------------------
+
+    text2 = pytesseract.image_to_string(
+        image,
+        lang="eng",
+        config="--psm 11"
+    )
+
+
+    return (
+        text1
+        + "\n"
+        + text2
+    )
+
+
+# ============================================================
+# SMART DOCUMENT NUMBER DETECTION
+# ============================================================
+
+def detect_doc_number_from_pdf(
+    pdf_path,
+    allow_ocr=True
+):
+
+    result = {
+        "doc_no": None,
+        "method": None,
+        "debug_text": "",
+    }
+
+
+    # ========================================================
+    # TEXT LAYER FIRST
+    # ========================================================
+
+    normal_text = extract_pdf_text(
         pdf_path,
         max_pages=3
     )
 
-    return normalize_document_number(
-        text
+
+    doc_no = normalize_document_number(
+        normal_text
     )
+
+
+    if doc_no:
+
+        result["doc_no"] = doc_no
+        result["method"] = "TEXT"
+        result["debug_text"] = normal_text
+
+        return result
+
+
+    # ========================================================
+    # OCR FALLBACK
+    # ========================================================
+
+    if not allow_ocr:
+
+        result["debug_text"] = normal_text
+
+        return result
+
+
+    try:
+
+        ocr_text = extract_pdf_text_ocr(
+            pdf_path
+        )
+
+
+        doc_no = normalize_document_number(
+            ocr_text
+        )
+
+
+        result["debug_text"] = ocr_text
+
+
+        if doc_no:
+
+            result["doc_no"] = doc_no
+            result["method"] = "OCR"
+
+
+        return result
+
+
+    except Exception as e:
+
+        result["debug_text"] = (
+            f"OCR ERROR: {e}"
+        )
+
+        return result
 
 
 # ============================================================
@@ -251,9 +452,17 @@ def word_to_pdf(
     if not expected_pdf.exists():
 
         raise RuntimeError(
+
             "Word → PDF 失敗\n\n"
-            f"STDOUT:\n{result.stdout}\n\n"
-            f"STDERR:\n{result.stderr}"
+
+            f"FILE:\n"
+            f"{Path(word_path).name}\n\n"
+
+            f"STDOUT:\n"
+            f"{result.stdout}\n\n"
+
+            f"STDERR:\n"
+            f"{result.stderr}"
         )
 
 
@@ -279,14 +488,18 @@ def replace_first_page(
     )
 
 
-    if len(cover_reader.pages) != 1:
+    if len(
+        cover_reader.pages
+    ) != 1:
 
         raise RuntimeError(
             "Signed Cover PDF 必須只有 1 頁"
         )
 
 
-    if len(main_reader.pages) < 1:
+    if len(
+        main_reader.pages
+    ) < 1:
 
         raise RuntimeError(
             "Word PDF 沒有頁面"
@@ -296,7 +509,7 @@ def replace_first_page(
     writer = PdfWriter()
 
 
-    # New cover
+    # Signed Cover
     writer.add_page(
         cover_reader.pages[0]
     )
@@ -320,14 +533,18 @@ def replace_first_page(
         "wb"
     ) as f:
 
-        writer.write(f)
+        writer.write(
+            f
+        )
 
 
 # ============================================================
 # ZIP
 # ============================================================
 
-def create_zip(result_files):
+def create_zip(
+    result_files
+):
 
     zip_buffer = io.BytesIO()
 
@@ -346,9 +563,65 @@ def create_zip(result_files):
             )
 
 
-    zip_buffer.seek(0)
+    zip_buffer.seek(
+        0
+    )
 
     return zip_buffer.getvalue()
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+def reset_analysis():
+
+    st.session_state[
+        "analysis_done"
+    ] = False
+
+    st.session_state[
+        "analysis_matches"
+    ] = []
+
+    st.session_state[
+        "analysis_errors"
+    ] = []
+
+    st.session_state[
+        "analysis_word_count"
+    ] = 0
+
+    st.session_state[
+        "analysis_cover_count"
+    ] = 0
+
+
+def reset_results():
+
+    st.session_state[
+        "result_files"
+    ] = []
+
+    st.session_state[
+        "result_zip"
+    ] = None
+
+    st.session_state[
+        "result_zip_name"
+    ] = None
+
+    st.session_state[
+        "last_success"
+    ] = 0
+
+    st.session_state[
+        "last_failed"
+    ] = 0
+
+    st.session_state[
+        "last_total"
+    ] = 0
 
 
 # ============================================================
@@ -372,7 +645,7 @@ def show_login():
     )
 
 
-    left, center, right = st.columns(
+    _, center, _ = st.columns(
         [1.3, 1, 1.3]
     )
 
@@ -430,8 +703,14 @@ def show_login():
                 password
             ):
 
-                st.session_state.authenticated = True
-                st.session_state.username = username
+                st.session_state[
+                    "authenticated"
+                ] = True
+
+                st.session_state[
+                    "username"
+                ] = username
+
                 st.rerun()
 
             else:
@@ -442,7 +721,7 @@ def show_login():
 
 
 # ============================================================
-# ANALYZE FILES
+# FILE CLASSIFICATION
 # ============================================================
 
 def analyze_uploaded_files(
@@ -450,7 +729,6 @@ def analyze_uploaded_files(
 ):
 
     word_files = []
-
     pdf_files = []
 
 
@@ -466,81 +744,35 @@ def analyze_uploaded_files(
             ".docx"
         ]:
 
-            word_files.append(f)
+            word_files.append(
+                f
+            )
 
 
         elif suffix == ".pdf":
 
-            pdf_files.append(f)
-
-
-    return word_files, pdf_files
-
-
-# ============================================================
-# BUILD MATCHING PREVIEW
-# ============================================================
-
-def build_matching_preview(
-    uploaded_files
-):
-
-    word_files, pdf_files = (
-        analyze_uploaded_files(
-            uploaded_files
-        )
-    )
-
-
-    rows = []
-
-    errors = []
-
-
-    # --------------------------------------------------------
-    # Basic count check
-    # --------------------------------------------------------
-
-    if len(word_files) != len(pdf_files):
-
-        errors.append(
-            (
-                "數量不一致："
-                f"Word = {len(word_files)}，"
-                f"Signed Cover PDF = {len(pdf_files)}"
+            pdf_files.append(
+                f
             )
-        )
-
-
-    if len(word_files) == 0:
-
-        errors.append(
-            "沒有找到 Word 檔案"
-        )
-
-
-    if len(pdf_files) == 0:
-
-        errors.append(
-            "沒有找到 Signed Cover PDF"
-        )
 
 
     return (
         word_files,
-        pdf_files,
-        rows,
-        errors
+        pdf_files
     )
 
 
 # ============================================================
-# PROCESS
+# ANALYSIS PROCESS
 # ============================================================
 
-def run_process(
+def run_analysis(
     uploaded_files
 ):
+
+    reset_analysis()
+    reset_results()
+
 
     word_files, cover_files = (
         analyze_uploaded_files(
@@ -549,20 +781,69 @@ def run_process(
     )
 
 
-    # --------------------------------------------------------
-    # Count validation
-    # --------------------------------------------------------
+    word_count = len(
+        word_files
+    )
 
-    if len(word_files) != len(cover_files):
+    cover_count = len(
+        cover_files
+    )
 
-        st.error(
-            "無法開始：Word 與 Signed Cover PDF 數量不一致。"
+
+    st.session_state[
+        "analysis_word_count"
+    ] = word_count
+
+    st.session_state[
+        "analysis_cover_count"
+    ] = cover_count
+
+
+    errors = []
+
+
+    # ========================================================
+    # COUNT WARNING
+    # ========================================================
+
+    if word_count != cover_count:
+
+        errors.append(
+            {
+                "TYPE": "COUNT",
+                "DOCUMENT NO.": "-",
+                "FILE": "-",
+                "ERROR": (
+                    f"數量不一致：Word = {word_count}，"
+                    f"Signed Cover = {cover_count}"
+                ),
+            }
         )
 
-        return
+
+    if word_count == 0:
+
+        errors.append(
+            {
+                "TYPE": "WORD",
+                "DOCUMENT NO.": "-",
+                "FILE": "-",
+                "ERROR": "沒有找到 Word 文件",
+            }
+        )
 
 
-    total = len(word_files)
+    if cover_count == 0:
+
+        errors.append(
+            {
+                "TYPE": "COVER",
+                "DOCUMENT NO.": "-",
+                "FILE": "-",
+                "ERROR": "沒有找到 Signed Cover PDF",
+            }
+        )
+
 
     progress = st.progress(
         0,
@@ -576,39 +857,62 @@ def run_process(
     )
 
 
-    result_files = []
+    # ========================================================
+    # STORE MULTIPLE FILES PER DOC
+    # ========================================================
 
-    success = 0
-    failed = 0
+    cover_candidates = {}
+    word_candidates = {}
 
 
-    with tempfile.TemporaryDirectory() as tmp:
+    total_steps = max(
+        word_count + cover_count,
+        1
+    )
 
-        tmp = Path(tmp)
+    current_step = 0
+
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+
+        tmp = Path(
+            tmp_dir
+        )
 
 
         # ====================================================
-        # STEP 1
-        # SAVE + ANALYZE COVERS
+        # ANALYZE COVER
         # ====================================================
-
-        cover_map = {}
 
         status.write(
             "→ Reading Signed Cover PDFs..."
         )
 
 
-        for cover in cover_files:
+        for index, cover in enumerate(
+            cover_files,
+            start=1
+        ):
+
+            current_step += 1
+
 
             cover_path = (
                 tmp
-                / cover.name
+                / (
+                    f"cover_"
+                    f"{index:04d}.pdf"
+                )
+            )
+
+
+            cover_bytes = (
+                cover.getvalue()
             )
 
 
             cover_path.write_bytes(
-                cover.getvalue()
+                cover_bytes
             )
 
 
@@ -618,97 +922,237 @@ def run_process(
                     str(cover_path)
                 )
 
-                if len(reader.pages) != 1:
 
-                    raise RuntimeError(
+                if len(
+                    reader.pages
+                ) != 1:
+
+                    errors.append(
+                        {
+                            "TYPE": "COVER",
+                            "DOCUMENT NO.": "-",
+                            "FILE": cover.name,
+                            "ERROR": (
+                                "Signed Cover 不是單頁 PDF "
+                                f"({len(reader.pages)} pages)"
+                            ),
+                        }
+                    )
+
+
+                    status.write(
                         (
-                            f"{cover.name} "
-                            "不是單頁 PDF"
+                            f"✗ COVER {cover.name} "
+                            "→ 不是單頁 PDF"
                         )
                     )
 
 
-                doc_no = (
+                    continue
+
+
+                detection = (
                     detect_doc_number_from_pdf(
-                        cover_path
+                        cover_path,
+                        allow_ocr=True
                     )
+                )
+
+
+                doc_no = (
+                    detection[
+                        "doc_no"
+                    ]
+                )
+
+
+                method = (
+                    detection[
+                        "method"
+                    ]
                 )
 
 
                 if not doc_no:
 
-                    raise RuntimeError(
-                        (
-                            f"{cover.name} "
-                            "找不到 DOC 文件編號"
+                    debug_text = (
+                        detection.get(
+                            "debug_text",
+                            ""
                         )
                     )
 
 
-                if doc_no in cover_map:
+                    errors.append(
+                        {
+                            "TYPE": "COVER",
+                            "DOCUMENT NO.": "-",
+                            "FILE": cover.name,
+                            "ERROR": (
+                                "OCR / PDF Text "
+                                "皆找不到 DOC 文件編號"
+                            ),
+                            "DEBUG": debug_text[:500],
+                        }
+                    )
 
-                    raise RuntimeError(
+
+                    status.write(
                         (
-                            "Signed Cover 文件編號重複："
-                            f"{doc_no}"
+                            f"✗ COVER {cover.name} "
+                            "→ 找不到 DOC 編號"
                         )
                     )
 
 
-                cover_map[
+                    continue
+
+
+                if doc_no not in cover_candidates:
+
+                    cover_candidates[
+                        doc_no
+                    ] = []
+
+
+                cover_candidates[
                     doc_no
-                ] = {
-                    "upload": cover,
-                    "path": cover_path,
-                    "name": cover.name,
-                }
+                ].append(
+                    {
+                        "doc_no": doc_no,
+                        "name": cover.name,
+                        "bytes": cover_bytes,
+                        "method": method,
+                    }
+                )
 
 
                 status.write(
                     (
-                        f"✓ COVER : "
-                        f"{cover.name}"
-                        f" → {doc_no}"
+                        f"✓ COVER [{index}/{cover_count}] "
+                        f"{cover.name} "
+                        f"→ {doc_no} [{method}]"
                     )
                 )
 
 
             except Exception as e:
 
-                status.update(
-                    label="ANALYSIS FAILED",
-                    state="error",
-                    expanded=True,
+                errors.append(
+                    {
+                        "TYPE": "COVER",
+                        "DOCUMENT NO.": "-",
+                        "FILE": cover.name,
+                        "ERROR": str(e),
+                    }
                 )
 
-                st.error(str(e))
 
-                return
+                status.write(
+                    (
+                        f"✗ COVER {cover.name} "
+                        f"→ {e}"
+                    )
+                )
+
+
+            finally:
+
+                percent = int(
+                    current_step
+                    / total_steps
+                    * 100
+                )
+
+
+                progress.progress(
+                    percent,
+                    text=(
+                        f"ANALYZING "
+                        f"{current_step}/{total_steps}"
+                    ),
+                )
 
 
         # ====================================================
-        # STEP 2
-        # SAVE + CONVERT + ANALYZE WORD
+        # COVER DUPLICATES
         # ====================================================
 
-        word_map = {}
+        for doc_no, items in (
+            cover_candidates.items()
+        ):
 
+            if len(items) > 1:
+
+                file_names = ", ".join(
+                    item["name"]
+                    for item in items
+                )
+
+
+                errors.append(
+                    {
+                        "TYPE": "COVER",
+                        "DOCUMENT NO.": doc_no,
+                        "FILE": file_names,
+                        "ERROR": (
+                            "Signed Cover 文件編號重複，"
+                            "此編號不會自動執行"
+                        ),
+                    }
+                )
+
+
+        # ====================================================
+        # ANALYZE WORD
+        # ====================================================
 
         status.write(
             "→ Converting and analyzing Word files..."
         )
 
 
-        for word in word_files:
+        word_pdf_dir = (
+            tmp
+            / "word_pdf"
+        )
+
+
+        word_pdf_dir.mkdir(
+            exist_ok=True
+        )
+
+
+        for index, word in enumerate(
+            word_files,
+            start=1
+        ):
+
+            current_step += 1
+
+
+            suffix = Path(
+                word.name
+            ).suffix.lower()
+
 
             word_path = (
                 tmp
-                / word.name
+                / (
+                    f"word_"
+                    f"{index:04d}"
+                    f"{suffix}"
+                )
+            )
+
+
+            word_bytes = (
+                word.getvalue()
             )
 
 
             word_path.write_bytes(
-                word.getvalue()
+                word_bytes
             )
 
 
@@ -716,217 +1160,472 @@ def run_process(
 
                 pdf_path = word_to_pdf(
                     word_path,
-                    tmp
+                    word_pdf_dir
+                )
+
+
+                detection = (
+                    detect_doc_number_from_pdf(
+                        pdf_path,
+                        allow_ocr=False
+                    )
                 )
 
 
                 doc_no = (
-                    detect_doc_number_from_pdf(
-                        pdf_path
-                    )
+                    detection[
+                        "doc_no"
+                    ]
                 )
 
 
                 if not doc_no:
 
-                    raise RuntimeError(
+                    errors.append(
+                        {
+                            "TYPE": "WORD",
+                            "DOCUMENT NO.": "-",
+                            "FILE": word.name,
+                            "ERROR": (
+                                "Word 轉 PDF 後 "
+                                "找不到 DOC 文件編號"
+                            ),
+                        }
+                    )
+
+
+                    status.write(
                         (
-                            f"{word.name} "
-                            "找不到 DOC 文件編號"
+                            f"✗ WORD {word.name} "
+                            "→ 找不到 DOC 編號"
                         )
                     )
 
 
-                if doc_no in word_map:
-
-                    raise RuntimeError(
-                        (
-                            "Word 文件編號重複："
-                            f"{doc_no}"
-                        )
-                    )
+                    continue
 
 
-                word_map[
+                if doc_no not in word_candidates:
+
+                    word_candidates[
+                        doc_no
+                    ] = []
+
+
+                word_candidates[
                     doc_no
-                ] = {
-                    "upload": word,
-                    "word_path": word_path,
-                    "pdf_path": pdf_path,
-                    "name": word.name,
-                }
+                ].append(
+                    {
+                        "doc_no": doc_no,
+                        "name": word.name,
+                        "bytes": word_bytes,
+                        "suffix": suffix,
+                    }
+                )
 
 
                 status.write(
                     (
-                        f"✓ WORD : "
-                        f"{word.name}"
-                        f" → {doc_no}"
+                        f"✓ WORD [{index}/{word_count}] "
+                        f"{word.name} "
+                        f"→ {doc_no}"
                     )
                 )
 
 
             except Exception as e:
 
-                status.update(
-                    label="ANALYSIS FAILED",
-                    state="error",
-                    expanded=True,
+                errors.append(
+                    {
+                        "TYPE": "WORD",
+                        "DOCUMENT NO.": "-",
+                        "FILE": word.name,
+                        "ERROR": str(e),
+                    }
                 )
 
-                st.error(str(e))
 
-                return
-
-
-        # ====================================================
-        # STEP 3
-        # MATCH VALIDATION
-        # ====================================================
-
-        cover_keys = set(
-            cover_map.keys()
-        )
-
-        word_keys = set(
-            word_map.keys()
-        )
-
-
-        missing_cover = (
-            word_keys
-            - cover_keys
-        )
-
-
-        missing_word = (
-            cover_keys
-            - word_keys
-        )
-
-
-        if missing_cover or missing_word:
-
-            status.update(
-                label="MATCHING FAILED",
-                state="error",
-                expanded=True,
-            )
-
-
-            if missing_cover:
-
-                st.error(
+                status.write(
                     (
-                        "以下 Word 找不到對應 Signed Cover：\n\n"
-                        + "\n".join(
-                            sorted(
-                                missing_cover
-                            )
-                        )
+                        f"✗ WORD {word.name} "
+                        f"→ {e}"
                     )
                 )
 
 
-            if missing_word:
+            finally:
 
-                st.error(
-                    (
-                        "以下 Signed Cover 找不到對應 Word：\n\n"
-                        + "\n".join(
-                            sorted(
-                                missing_word
-                            )
-                        )
-                    )
+                percent = int(
+                    current_step
+                    / total_steps
+                    * 100
                 )
 
 
-            return
+                progress.progress(
+                    percent,
+                    text=(
+                        f"ANALYZING "
+                        f"{current_step}/{total_steps}"
+                    ),
+                )
 
 
         # ====================================================
-        # MATCHING PREVIEW
+        # WORD DUPLICATES
         # ====================================================
 
-        mapping_rows = []
-
-
-        for doc_no in sorted(
-            word_keys
+        for doc_no, items in (
+            word_candidates.items()
         ):
 
-            mapping_rows.append(
+            if len(items) > 1:
+
+                file_names = ", ".join(
+                    item["name"]
+                    for item in items
+                )
+
+
+                errors.append(
+                    {
+                        "TYPE": "WORD",
+                        "DOCUMENT NO.": doc_no,
+                        "FILE": file_names,
+                        "ERROR": (
+                            "Word 文件編號重複，"
+                            "此編號不會自動執行"
+                        ),
+                    }
+                )
+
+
+    # ========================================================
+    # MATCH
+    # ========================================================
+
+    matches = []
+
+
+    all_doc_numbers = (
+        set(
+            cover_candidates.keys()
+        )
+        |
+        set(
+            word_candidates.keys()
+        )
+    )
+
+
+    for doc_no in sorted(
+        all_doc_numbers
+    ):
+
+        covers = (
+            cover_candidates.get(
+                doc_no,
+                []
+            )
+        )
+
+        words = (
+            word_candidates.get(
+                doc_no,
+                []
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # Exactly one Word + one Cover = safe match
+        # ----------------------------------------------------
+
+        if (
+            len(covers) == 1
+            and
+            len(words) == 1
+        ):
+
+            matches.append(
                 {
-                    "DOCUMENT NO.":
-                    doc_no,
+                    "doc_no": doc_no,
 
-                    "WORD FILE":
-                    word_map[
-                        doc_no
-                    ][
-                        "name"
-                    ],
+                    "word_name":
+                    words[0]["name"],
 
-                    "SIGNED COVER":
-                    cover_map[
-                        doc_no
-                    ][
-                        "name"
-                    ],
+                    "word_bytes":
+                    words[0]["bytes"],
 
-                    "STATUS":
-                    "MATCHED",
+                    "word_suffix":
+                    words[0]["suffix"],
+
+                    "cover_name":
+                    covers[0]["name"],
+
+                    "cover_bytes":
+                    covers[0]["bytes"],
+
+                    "cover_method":
+                    covers[0]["method"],
                 }
             )
 
 
-        st.markdown(
-            "### AUTO MATCHING RESULT"
+        # ----------------------------------------------------
+        # Missing cover
+        # ----------------------------------------------------
+
+        elif (
+            len(words) == 1
+            and
+            len(covers) == 0
+        ):
+
+            errors.append(
+                {
+                    "TYPE": "MATCH",
+                    "DOCUMENT NO.": doc_no,
+                    "FILE": words[0]["name"],
+                    "ERROR": (
+                        "Word 找不到對應 Signed Cover"
+                    ),
+                }
+            )
+
+
+        # ----------------------------------------------------
+        # Missing Word
+        # ----------------------------------------------------
+
+        elif (
+            len(covers) == 1
+            and
+            len(words) == 0
+        ):
+
+            errors.append(
+                {
+                    "TYPE": "MATCH",
+                    "DOCUMENT NO.": doc_no,
+                    "FILE": covers[0]["name"],
+                    "ERROR": (
+                        "Signed Cover 找不到對應 Word"
+                    ),
+                }
+            )
+
+
+        # Duplicate cases already have errors above.
+        # Add a matching ambiguity message too.
+        elif (
+            len(covers) > 1
+            or
+            len(words) > 1
+        ):
+
+            errors.append(
+                {
+                    "TYPE": "MATCH",
+                    "DOCUMENT NO.": doc_no,
+                    "FILE": "-",
+                    "ERROR": (
+                        "無法建立唯一配對，"
+                        "此文件編號已排除執行"
+                    ),
+                }
+            )
+
+
+    # ========================================================
+    # SAVE ANALYSIS
+    # ========================================================
+
+    st.session_state[
+        "analysis_done"
+    ] = True
+
+    st.session_state[
+        "analysis_matches"
+    ] = matches
+
+    st.session_state[
+        "analysis_errors"
+    ] = errors
+
+
+    progress.progress(
+        100,
+        text="ANALYSIS COMPLETE"
+    )
+
+
+    status.update(
+        label=(
+            "ANALYSIS COMPLETE "
+            f"| MATCHED: {len(matches)} "
+            f"| ERRORS: {len(errors)}"
+        ),
+        state="complete",
+        expanded=True,
+    )
+
+
+# ============================================================
+# EXECUTE MATCHED ITEMS
+# ============================================================
+
+def execute_matched_items():
+
+    matches = (
+        st.session_state[
+            "analysis_matches"
+        ]
+    )
+
+
+    if not matches:
+
+        st.error(
+            "目前沒有可執行的吻合項目。"
+        )
+
+        return
+
+
+    reset_results()
+
+
+    total = len(
+        matches
+    )
+
+    success = 0
+    failed = 0
+
+    result_files = []
+
+
+    progress = st.progress(
+        0,
+        text="PROCESSING MATCHED ITEMS..."
+    )
+
+
+    status = st.status(
+        "CREATING FINAL PDF...",
+        expanded=True,
+    )
+
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+
+        tmp = Path(
+            tmp_dir
         )
 
 
-        st.dataframe(
-            mapping_rows,
-            use_container_width=True,
-            hide_index=True,
+        word_dir = (
+            tmp
+            / "word"
+        )
+
+        pdf_dir = (
+            tmp
+            / "pdf"
+        )
+
+        cover_dir = (
+            tmp
+            / "cover"
+        )
+
+        final_dir = (
+            tmp
+            / "final"
         )
 
 
-        # ====================================================
-        # STEP 4
-        # CREATE FINAL PDF
-        # ====================================================
+        for folder in [
+            word_dir,
+            pdf_dir,
+            cover_dir,
+            final_dir
+        ]:
 
-        status.write(
-            "→ Replacing cover pages..."
-        )
+            folder.mkdir(
+                exist_ok=True
+            )
 
 
-        for index, doc_no in enumerate(
-            sorted(word_keys),
+        for index, item in enumerate(
+            matches,
             start=1
         ):
 
+            doc_no = (
+                item[
+                    "doc_no"
+                ]
+            )
+
+
             try:
 
+                # --------------------------------------------
+                # Restore Word
+                # --------------------------------------------
+
+                word_path = (
+                    word_dir
+                    / (
+                        f"word_{index:04d}"
+                        f"{item['word_suffix']}"
+                    )
+                )
+
+
+                word_path.write_bytes(
+                    item[
+                        "word_bytes"
+                    ]
+                )
+
+
+                # --------------------------------------------
+                # Restore Cover
+                # --------------------------------------------
+
+                cover_path = (
+                    cover_dir
+                    / (
+                        f"cover_{index:04d}.pdf"
+                    )
+                )
+
+
+                cover_path.write_bytes(
+                    item[
+                        "cover_bytes"
+                    ]
+                )
+
+
+                # --------------------------------------------
+                # Word → PDF
+                # --------------------------------------------
+
                 main_pdf = (
-                    word_map[
-                        doc_no
-                    ][
-                        "pdf_path"
-                    ]
+                    word_to_pdf(
+                        word_path,
+                        pdf_dir
+                    )
                 )
 
 
-                cover_pdf = (
-                    cover_map[
-                        doc_no
-                    ][
-                        "path"
-                    ]
-                )
-
+                # --------------------------------------------
+                # Final
+                # --------------------------------------------
 
                 final_name = (
                     f"{doc_no}-Final.pdf"
@@ -934,22 +1633,22 @@ def run_process(
 
 
                 final_path = (
-                    tmp
+                    final_dir
                     / final_name
                 )
 
 
                 replace_first_page(
-                    cover_pdf,
+                    cover_path,
                     main_pdf,
-                    final_path,
+                    final_path
                 )
 
 
                 result_files.append(
                     (
                         final_name,
-                        final_path.read_bytes(),
+                        final_path.read_bytes()
                     )
                 )
 
@@ -960,7 +1659,8 @@ def run_process(
                 status.write(
                     (
                         f"✓ [{index}/{total}] "
-                        f"{final_name}"
+                        f"{doc_no} "
+                        f"→ {final_name}"
                     )
                 )
 
@@ -973,8 +1673,8 @@ def run_process(
                 status.write(
                     (
                         f"✗ [{index}/{total}] "
-                        f"{doc_no}: "
-                        f"{e}"
+                        f"{doc_no} "
+                        f"→ {e}"
                     )
                 )
 
@@ -989,63 +1689,66 @@ def run_process(
             progress.progress(
                 percent,
                 text=(
-                    f"{index} / "
-                    f"{total} "
+                    f"{index}/{total} "
                     f"({percent}%)"
                 ),
             )
 
 
     # ========================================================
-    # ZIP
+    # OUTPUT
     # ========================================================
 
-    finished_at = datetime.now(
-        TAIPEI_TZ
-    )
+    if result_files:
 
-
-    timestamp = (
-        finished_at.strftime(
-            "%Y%m%d_%H%M%S"
+        timestamp = (
+            datetime.now(
+                TAIPEI_TZ
+            ).strftime(
+                "%Y%m%d_%H%M%S"
+            )
         )
-    )
 
 
-    zip_name = (
-        f"PLM_PDF_"
-        f"{timestamp}.zip"
-    )
+        zip_name = (
+            f"PLM_PDF_"
+            f"{timestamp}.zip"
+        )
 
 
-    zip_data = create_zip(
-        result_files
-    )
+        zip_data = (
+            create_zip(
+                result_files
+            )
+        )
 
 
-    st.session_state.result_files = (
-        result_files
-    )
+        st.session_state[
+            "result_files"
+        ] = result_files
 
-    st.session_state.result_zip = (
-        zip_data
-    )
 
-    st.session_state.result_zip_name = (
-        zip_name
-    )
+        st.session_state[
+            "result_zip"
+        ] = zip_data
 
-    st.session_state.last_success = (
-        success
-    )
 
-    st.session_state.last_failed = (
-        failed
-    )
+        st.session_state[
+            "result_zip_name"
+        ] = zip_name
 
-    st.session_state.last_total = (
-        total
-    )
+
+    st.session_state[
+        "last_success"
+    ] = success
+
+    st.session_state[
+        "last_failed"
+    ] = failed
+
+    st.session_state[
+        "last_total"
+    ] = total
 
 
     status.update(
@@ -1064,16 +1767,253 @@ def run_process(
 
 
 # ============================================================
-# DOWNLOAD
+# SHOW ANALYSIS RESULT
+# ============================================================
+
+def show_analysis_result():
+
+    if not st.session_state[
+        "analysis_done"
+    ]:
+
+        return
+
+
+    matches = (
+        st.session_state[
+            "analysis_matches"
+        ]
+    )
+
+    errors = (
+        st.session_state[
+            "analysis_errors"
+        ]
+    )
+
+
+    st.divider()
+
+
+    st.subheader(
+        "ANALYSIS RESULT"
+    )
+
+
+    c1, c2, c3 = st.columns(
+        3
+    )
+
+
+    c1.metric(
+        "MATCHED",
+        len(matches)
+    )
+
+
+    c2.metric(
+        "ERROR ITEMS",
+        len(errors)
+    )
+
+
+    c3.metric(
+        "EXECUTABLE",
+        len(matches)
+    )
+
+
+    # ========================================================
+    # MATCH TABLE
+    # ========================================================
+
+    if matches:
+
+        st.markdown(
+            "### ✓ MATCHED ITEMS"
+        )
+
+
+        matched_rows = []
+
+
+        for item in matches:
+
+            matched_rows.append(
+                {
+                    "DOCUMENT NO.":
+                    item["doc_no"],
+
+                    "WORD FILE":
+                    item["word_name"],
+
+                    "SIGNED COVER":
+                    item["cover_name"],
+
+                    "DETECTION":
+                    item["cover_method"],
+
+                    "STATUS":
+                    "READY",
+                }
+            )
+
+
+        st.dataframe(
+            matched_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+    else:
+
+        st.warning(
+            "沒有找到可安全執行的一對一配對。"
+        )
+
+
+    # ========================================================
+    # ERROR TABLE
+    # ========================================================
+
+    if errors:
+
+        st.markdown(
+            "### ⚠ ERROR / UNMATCHED ITEMS"
+        )
+
+
+        error_rows = []
+
+
+        for error in errors:
+
+            error_rows.append(
+                {
+                    "TYPE":
+                    error.get(
+                        "TYPE",
+                        "-"
+                    ),
+
+                    "DOCUMENT NO.":
+                    error.get(
+                        "DOCUMENT NO.",
+                        "-"
+                    ),
+
+                    "FILE":
+                    error.get(
+                        "FILE",
+                        "-"
+                    ),
+
+                    "ERROR":
+                    error.get(
+                        "ERROR",
+                        "-"
+                    ),
+                }
+            )
+
+
+        st.dataframe(
+            error_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+        with st.expander(
+            "ERROR DETAILS / OCR DEBUG"
+        ):
+
+            has_debug = False
+
+
+            for error in errors:
+
+                debug = error.get(
+                    "DEBUG",
+                    ""
+                )
+
+
+                if debug:
+
+                    has_debug = True
+
+                    st.markdown(
+                        f"**{error.get('FILE', '-')}**"
+                    )
+
+                    st.code(
+                        debug
+                    )
+
+
+            if not has_debug:
+
+                st.write(
+                    "目前沒有 OCR Debug 資訊。"
+                )
+
+
+    # ========================================================
+    # EXECUTE BUTTON
+    # ========================================================
+
+    st.divider()
+
+
+    if matches:
+
+        st.info(
+            (
+                f"已確認 {len(matches)} 組可安全配對。"
+                "錯誤項目將跳過，不影響吻合項目執行。"
+            )
+        )
+
+
+        if st.button(
+            (
+                f"執行吻合項目 "
+                f"({len(matches)})"
+            ),
+            type="primary",
+            use_container_width=True,
+            key="execute_matched",
+        ):
+
+            execute_matched_items()
+
+
+    else:
+
+        st.button(
+            "執行吻合項目 (0)",
+            disabled=True,
+            use_container_width=True,
+        )
+
+
+# ============================================================
+# DOWNLOAD RESULTS
 # ============================================================
 
 def show_download_results():
 
-    if not st.session_state.result_zip:
+    if not st.session_state[
+        "result_zip"
+    ]:
+
         return
 
 
     st.divider()
+
 
     st.subheader(
         "OUTPUT"
@@ -1087,32 +2027,42 @@ def show_download_results():
 
     c1.metric(
         "TOTAL",
-        st.session_state.last_total
+        st.session_state[
+            "last_total"
+        ]
     )
 
 
     c2.metric(
         "SUCCESS",
-        st.session_state.last_success
+        st.session_state[
+            "last_success"
+        ]
     )
 
 
     c3.metric(
         "FAILED",
-        st.session_state.last_failed
+        st.session_state[
+            "last_failed"
+        ]
     )
 
 
     st.download_button(
         label=(
             "DOWNLOAD ALL "
-            f"({st.session_state.last_success} FILES)"
+            f"({st.session_state['last_success']} FILES)"
         ),
         data=(
-            st.session_state.result_zip
+            st.session_state[
+                "result_zip"
+            ]
         ),
         file_name=(
-            st.session_state.result_zip_name
+            st.session_state[
+                "result_zip_name"
+            ]
         ),
         mime="application/zip",
         type="primary",
@@ -1124,8 +2074,13 @@ def show_download_results():
         "INDIVIDUAL PDF DOWNLOADS"
     ):
 
-        for filename, data in (
-            st.session_state.result_files
+        for index, (
+            filename,
+            data
+        ) in enumerate(
+            st.session_state[
+                "result_files"
+            ]
         ):
 
             st.download_button(
@@ -1134,20 +2089,24 @@ def show_download_results():
                 file_name=filename,
                 mime="application/pdf",
                 key=(
-                    "download_"
-                    + filename
+                    f"download_"
+                    f"{index}_"
+                    f"{filename}"
                 ),
+                use_container_width=True,
             )
 
 
 # ============================================================
-# MAIN
+# MAIN APP
 # ============================================================
 
 def show_main_app():
 
     username = (
-        st.session_state.username
+        st.session_state[
+            "username"
+        ]
     )
 
 
@@ -1185,12 +2144,16 @@ def show_main_app():
             use_container_width=True
         ):
 
-            st.session_state.authenticated = False
-            st.session_state.username = None
+            st.session_state[
+                "authenticated"
+            ] = False
 
-            st.session_state.result_files = []
-            st.session_state.result_zip = None
-            st.session_state.result_zip_name = None
+            st.session_state[
+                "username"
+            ] = None
+
+            reset_analysis()
+            reset_results()
 
             st.rerun()
 
@@ -1202,25 +2165,17 @@ def show_main_app():
         """
         ### AUTO PDF COVER MATCHING
 
-        一次拖入：
+        一次上傳 **Word 文件 + Signed Cover PDF**。
 
-        - Word 文件
-        - Signed Cover PDF
+        Signed Cover 檔名可以任意。
 
-        Signed Cover **檔名可以任意**。
-
-        系統會讀取文件內容中的：
+        系統會從文件內容辨識：
 
         `DOC-YYYY-NNNNN`
 
-        自動尋找對應 Word。
+        Signed Cover 若為掃描 PDF，會自動 OCR。
 
-        注意：
-
-        - 每份 Signed Cover 必須只有 1 頁
-        - Word 與 Signed Cover 數量必須一致
-        - 文件編號不可重複
-        - 找不到對應文件時不會執行
+        **無法配對的項目只會列為 Error，不會阻止其他已吻合項目執行。**
         """
     )
 
@@ -1233,6 +2188,7 @@ def show_main_app():
             "pdf"
         ],
         accept_multiple_files=True,
+        key="main_upload",
     )
 
 
@@ -1244,6 +2200,10 @@ def show_main_app():
             )
         )
 
+
+        # ====================================================
+        # FILE COUNT
+        # ====================================================
 
         c1, c2, c3 = st.columns(
             3
@@ -1264,8 +2224,8 @@ def show_main_app():
 
         count_ok = (
             len(word_files)
-            == len(pdf_files)
-            and len(word_files) > 0
+            ==
+            len(pdf_files)
         )
 
 
@@ -1274,33 +2234,48 @@ def show_main_app():
             (
                 "OK"
                 if count_ok
-                else "ERROR"
+                else "WARNING"
             )
         )
 
 
         if not count_ok:
 
-            st.error(
+            st.warning(
                 (
-                    "Word 與 Signed Cover PDF 數量必須完全一致。"
-                    f"目前 Word = {len(word_files)}，"
-                    f"PDF = {len(pdf_files)}"
+                    "Word 與 Signed Cover 數量不一致。"
+                    "仍可進行分析，已吻合的項目仍可執行。 "
+                    f"Word = {len(word_files)} / "
+                    f"Signed Cover = {len(pdf_files)}"
                 )
             )
 
 
+        # ====================================================
+        # ANALYZE BUTTON
+        # ====================================================
+
         if st.button(
-            "ANALYZE & START PROCESS",
+            "ANALYZE FILES",
             type="primary",
             use_container_width=True,
-            disabled=not count_ok,
         ):
 
-            run_process(
+            run_analysis(
                 uploaded_files
             )
 
+
+    # ========================================================
+    # ANALYSIS RESULT
+    # ========================================================
+
+    show_analysis_result()
+
+
+    # ========================================================
+    # DOWNLOAD
+    # ========================================================
 
     show_download_results()
 
@@ -1309,7 +2284,9 @@ def show_main_app():
 # START
 # ============================================================
 
-if not st.session_state.authenticated:
+if not st.session_state[
+    "authenticated"
+]:
 
     show_login()
 
