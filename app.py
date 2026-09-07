@@ -1,17 +1,11 @@
 import io
 import hmac
-import time
-import smtplib
-import hashlib
-import secrets
 import zipfile
 import subprocess
 import tempfile
 
 from pathlib import Path
-from datetime import datetime, timedelta
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -25,13 +19,9 @@ from pypdf import PdfReader, PdfWriter
 # ============================================================
 
 APP_NAME = "PLM PDF Automation Tool"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
-
-OTP_EXPIRE_MINUTES = 5
-OTP_RESEND_SECONDS = 60
-OTP_MAX_ATTEMPTS = 5
 
 
 st.set_page_config(
@@ -66,16 +56,16 @@ st.markdown(
         margin-bottom: 18px;
     }
 
+    .system-tag {
+        font-family: monospace;
+        font-size: 13px;
+        color: #666;
+    }
+
     div[data-testid="stMetric"] {
         border: 1px solid #d9d9d9;
         border-radius: 6px;
         padding: 12px;
-    }
-
-    .login-info {
-        font-family: monospace;
-        font-size: 13px;
-        color: #666;
     }
 
     </style>
@@ -91,14 +81,6 @@ st.markdown(
 DEFAULT_SESSION = {
     "authenticated": False,
     "username": None,
-
-    "otp_sent": False,
-    "otp_code": None,
-    "otp_expire_at": None,
-    "otp_last_sent_at": None,
-    "otp_attempts": 0,
-    "otp_account": None,
-    "otp_email": None,
 
     "result_files": [],
     "result_zip": None,
@@ -116,7 +98,13 @@ for key, value in DEFAULT_SESSION.items():
 
 
 # ============================================================
-# USERS
+# USER DATABASE
+#
+# Streamlit Secrets:
+#
+# [users.Charles]
+# password = "A00027"
+#
 # ============================================================
 
 def get_user_db():
@@ -130,20 +118,14 @@ def get_user_db():
         for username, data in users.items():
 
             result[username] = {
-                "email": str(data["email"]).strip().lower(),
-                "algo": str(data["algo"]),
-                "iter": int(data["iter"]),
-                "salt": str(data["salt"]),
-                "hash": str(data["hash"]),
+                "password": str(data["password"]).strip()
             }
 
         return result
 
     except Exception as e:
 
-        st.error(
-            "無法讀取使用者設定。"
-        )
+        st.error("無法讀取使用者設定。")
 
         st.code(str(e))
 
@@ -157,236 +139,19 @@ USER_DB = get_user_db()
 # PASSWORD VERIFY
 # ============================================================
 
-def verify_password(
-    username,
-    password
-):
+def verify_password(username, password):
 
     if username not in USER_DB:
         return False
 
-    info = USER_DB[username]
+    expected = USER_DB[username]["password"]
 
-    if info["algo"] != "pbkdf2_sha256":
-        return False
+    entered = str(password).strip()
 
-    try:
-
-        salt = bytes.fromhex(
-            info["salt"]
-        )
-
-        expected = bytes.fromhex(
-            info["hash"]
-        )
-
-        calculated = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt,
-            int(info["iter"]),
-        )
-
-        return hmac.compare_digest(
-            calculated,
-            expected,
-        )
-
-    except Exception:
-
-        return False
-
-
-# ============================================================
-# EMAIL MASK
-# ============================================================
-
-def mask_email(email):
-
-    try:
-
-        account, domain = email.split(
-            "@",
-            1
-        )
-
-        if len(account) <= 2:
-            masked = account[0] + "*"
-        else:
-            masked = (
-                account[:2]
-                + "*" * max(
-                    len(account) - 2,
-                    2
-                )
-            )
-
-        return (
-            masked
-            + "@"
-            + domain
-        )
-
-    except:
-
-        return email
-
-
-# ============================================================
-# OTP
-# ============================================================
-
-def generate_otp():
-
-    return f"{secrets.randbelow(1000000):06d}"
-
-
-# ============================================================
-# SMTP CONFIG
-# ============================================================
-
-def get_email_config():
-
-    try:
-
-        config = st.secrets["email"]
-
-        return {
-            "smtp_host": str(
-                config["smtp_host"]
-            ),
-            "smtp_port": int(
-                config["smtp_port"]
-            ),
-            "sender_email": str(
-                config["sender_email"]
-            ),
-            "sender_password": str(
-                config["sender_password"]
-            ),
-            "use_tls": bool(
-                config.get(
-                    "use_tls",
-                    True
-                )
-            ),
-        }
-
-    except Exception as e:
-
-        raise RuntimeError(
-            f"SMTP Secrets 設定錯誤：{e}"
-        )
-
-
-# ============================================================
-# SEND OTP
-# ============================================================
-
-def send_otp_email(
-    username,
-    target_email,
-    otp
-):
-
-    cfg = get_email_config()
-
-    subject = (
-        "PLM PDF Automation - Verification Code"
+    return hmac.compare_digest(
+        entered,
+        expected
     )
-
-    body = f"""
-Hi {username},
-
-Your verification code is:
-
-{otp}
-
-This code will expire in {OTP_EXPIRE_MINUTES} minutes.
-
-If you did not request this code, please ignore this email.
-
-PLM PDF Automation Tool
-Version {APP_VERSION}
-"""
-
-
-    msg = MIMEMultipart()
-
-    msg["From"] = cfg[
-        "sender_email"
-    ]
-
-    msg["To"] = target_email
-
-    msg["Subject"] = subject
-
-
-    msg.attach(
-        MIMEText(
-            body,
-            "plain",
-            "utf-8"
-        )
-    )
-
-
-    server = smtplib.SMTP(
-        cfg["smtp_host"],
-        cfg["smtp_port"],
-        timeout=20,
-    )
-
-
-    try:
-
-        server.ehlo()
-
-        if cfg["use_tls"]:
-
-            server.starttls()
-
-            server.ehlo()
-
-
-        server.login(
-            cfg["sender_email"],
-            cfg["sender_password"],
-        )
-
-
-        server.sendmail(
-            cfg["sender_email"],
-            [target_email],
-            msg.as_string(),
-        )
-
-
-    finally:
-
-        try:
-            server.quit()
-        except:
-            pass
-
-
-# ============================================================
-# RESET OTP
-# ============================================================
-
-def reset_otp():
-
-    st.session_state.otp_sent = False
-
-    st.session_state.otp_code = None
-
-    st.session_state.otp_expire_at = None
-
-    st.session_state.otp_attempts = 0
-
-    st.session_state.otp_account = None
-
-    st.session_state.otp_email = None
 
 
 # ============================================================
@@ -402,75 +167,14 @@ def get_supabase_config():
         ).rstrip("/")
 
         key = str(
-            st.secrets[
-                "supabase"
-            ][
-                "service_role_key"
-            ]
+            st.secrets["supabase"]["service_role_key"]
         )
 
         return url, key
 
-    except:
+    except Exception:
 
         return None, None
-
-
-# ============================================================
-# WRITE LOGIN LOG
-# ============================================================
-
-def write_login_log(
-    username,
-    email,
-    success,
-):
-
-    url, key = get_supabase_config()
-
-    if not url or not key:
-        return
-
-
-    payload = {
-        "username": username,
-        "email": email,
-        "login_time": datetime.now(
-            TAIPEI_TZ
-        ).isoformat(),
-        "otp_verified": bool(
-            success
-        ),
-        "app_version": APP_VERSION,
-    }
-
-
-    headers = {
-        "apikey": key,
-        "Authorization": (
-            f"Bearer {key}"
-        ),
-        "Content-Type": (
-            "application/json"
-        ),
-        "Prefer": "return=minimal",
-    }
-
-
-    try:
-
-        requests.post(
-            (
-                f"{url}"
-                "/rest/v1/login_log"
-            ),
-            headers=headers,
-            json=payload,
-            timeout=10,
-        )
-
-    except:
-        pass
 
 
 # ============================================================
@@ -490,40 +194,27 @@ def write_usage_log(
 
     if not url or not key:
 
-        return (
-            False,
-            "Supabase 尚未設定"
-        )
+        return False, "Supabase 尚未設定"
 
 
     duration = (
-        finished_at
-        - started_at
+        finished_at - started_at
     ).total_seconds()
 
 
     payload = {
+
         "username": username,
 
-        "started_at": (
-            started_at.isoformat()
-        ),
+        "started_at": started_at.isoformat(),
 
-        "finished_at": (
-            finished_at.isoformat()
-        ),
+        "finished_at": finished_at.isoformat(),
 
-        "file_count": int(
-            file_count
-        ),
+        "file_count": int(file_count),
 
-        "success_count": int(
-            success_count
-        ),
+        "success_count": int(success_count),
 
-        "failed_count": int(
-            failed_count
-        ),
+        "failed_count": int(failed_count),
 
         "duration_seconds": round(
             duration,
@@ -535,13 +226,13 @@ def write_usage_log(
 
 
     headers = {
+
         "apikey": key,
-        "Authorization": (
-            f"Bearer {key}"
-        ),
-        "Content-Type": (
-            "application/json"
-        ),
+
+        "Authorization": f"Bearer {key}",
+
+        "Content-Type": "application/json",
+
         "Prefer": "return=minimal",
     }
 
@@ -549,12 +240,13 @@ def write_usage_log(
     try:
 
         response = requests.post(
-            (
-                f"{url}"
-                "/rest/v1/usage_log"
-            ),
+
+            f"{url}/rest/v1/usage_log",
+
             headers=headers,
+
             json=payload,
+
             timeout=15,
         )
 
@@ -570,29 +262,20 @@ def write_usage_log(
 
         return (
             False,
-            (
-                f"HTTP "
-                f"{response.status_code}: "
-                f"{response.text}"
-            )
+            f"HTTP {response.status_code}: {response.text}"
         )
 
 
     except Exception as e:
 
-        return (
-            False,
-            str(e)
-        )
+        return False, str(e)
 
 
 # ============================================================
 # READ USAGE LOG
 # ============================================================
 
-def read_usage_logs(
-    limit=1000
-):
+def read_usage_logs(limit=1000):
 
     url, key = get_supabase_config()
 
@@ -601,17 +284,19 @@ def read_usage_logs(
 
 
     headers = {
+
         "apikey": key,
 
-        "Authorization": (
-            f"Bearer {key}"
-        ),
+        "Authorization": f"Bearer {key}",
     }
 
 
     params = {
+
         "select": "*",
+
         "order": "started_at.desc",
+
         "limit": limit,
     }
 
@@ -619,12 +304,13 @@ def read_usage_logs(
     try:
 
         response = requests.get(
-            (
-                f"{url}"
-                "/rest/v1/usage_log"
-            ),
+
+            f"{url}/rest/v1/usage_log",
+
             headers=headers,
+
             params=params,
+
             timeout=15,
         )
 
@@ -634,7 +320,8 @@ def read_usage_logs(
             return response.json()
 
 
-    except:
+    except Exception:
+
         pass
 
 
@@ -643,6 +330,7 @@ def read_usage_logs(
 
 # ============================================================
 # WORD → PDF
+# LibreOffice Headless
 # ============================================================
 
 def word_to_pdf(
@@ -650,47 +338,53 @@ def word_to_pdf(
     output_dir
 ):
 
-    output_dir = Path(
-        output_dir
-    )
+    output_dir = Path(output_dir)
 
 
     command = [
+
         "libreoffice",
+
         "--headless",
+
         "--convert-to",
+
         "pdf",
+
         "--outdir",
+
         str(output_dir),
+
         str(word_path),
     ]
 
 
     result = subprocess.run(
+
         command,
+
         stdout=subprocess.PIPE,
+
         stderr=subprocess.PIPE,
+
         text=True,
+
         timeout=180,
     )
 
 
     expected_pdf = (
         output_dir
-        / (
-            Path(
-                word_path
-            ).stem
-            + ".pdf"
-        )
+        / f"{Path(word_path).stem}.pdf"
     )
 
 
     if not expected_pdf.exists():
 
         raise RuntimeError(
-            "Word → PDF 失敗\n"
-            f"{result.stderr}"
+            "Word → PDF 失敗\n\n"
+            f"STDOUT:\n{result.stdout}\n\n"
+            f"STDERR:\n{result.stderr}"
         )
 
 
@@ -699,6 +393,10 @@ def word_to_pdf(
 
 # ============================================================
 # REPLACE FIRST PAGE
+#
+# Cover PDF 第一頁
+# +
+# Word PDF 第 2 頁以後
 # ============================================================
 
 def replace_first_page(
@@ -716,37 +414,39 @@ def replace_first_page(
     )
 
 
-    if len(
-        cover_reader.pages
-    ) != 1:
+    if len(cover_reader.pages) != 1:
 
         raise RuntimeError(
             "Cover PDF 必須只有 1 頁"
         )
 
 
-    if len(
-        main_reader.pages
-    ) < 1:
+    if len(main_reader.pages) < 1:
 
         raise RuntimeError(
-            "Word PDF 沒有頁面"
+            "Word PDF 沒有任何頁面"
         )
 
 
     writer = PdfWriter()
 
 
+    # --------------------------------------------------------
+    # NEW COVER
+    # --------------------------------------------------------
+
     writer.add_page(
         cover_reader.pages[0]
     )
 
 
+    # --------------------------------------------------------
+    # ORIGINAL PDF PAGE 2 ~ END
+    # --------------------------------------------------------
+
     for page_index in range(
         1,
-        len(
-            main_reader.pages
-        )
+        len(main_reader.pages)
     ):
 
         writer.add_page(
@@ -768,17 +468,19 @@ def replace_first_page(
 # CREATE ZIP
 # ============================================================
 
-def create_zip(
-    result_files
-):
+def create_zip(result_files):
 
     zip_buffer = io.BytesIO()
 
 
     with zipfile.ZipFile(
+
         zip_buffer,
+
         "w",
+
         zipfile.ZIP_DEFLATED,
+
     ) as zf:
 
         for filename, data in result_files:
@@ -816,57 +518,54 @@ def show_login():
 
 
     left, center, right = st.columns(
-        [1.2, 1, 1.2]
+        [1.3, 1, 1.3]
     )
 
 
     with center:
 
         st.subheader(
-            "AUTHENTICATION"
-        )
-
-
-        username = st.selectbox(
-            "Account",
-            options=sorted(
-                USER_DB.keys()
-            ),
-            index=None,
-            placeholder=(
-                "Select account"
-            ),
-        )
-
-
-        email = st.text_input(
-            "E-mail",
-            placeholder=(
-                "name@company.com"
-            ),
-        )
-
-
-        password = st.text_input(
-            "Password",
-            type="password",
+            "USER LOGIN"
         )
 
 
         st.caption(
-            "帳號、Email、密碼皆正確後，"
-            "系統才會寄送 6 碼驗證碼。"
+            "Authorized Personnel Only"
         )
 
 
-        # ====================================================
-        # SEND OTP
-        # ====================================================
+        username = st.selectbox(
+
+            "Account",
+
+            options=sorted(
+                USER_DB.keys()
+            ),
+
+            index=None,
+
+            placeholder="Select account",
+        )
+
+
+        password = st.text_input(
+
+            "Password / Employee ID",
+
+            type="password",
+
+            placeholder="Enter employee ID",
+        )
+
 
         if st.button(
-            "SEND VERIFICATION CODE",
+
+            "LOGIN",
+
             type="primary",
+
             use_container_width=True,
+
         ):
 
             if not username:
@@ -875,315 +574,35 @@ def show_login():
                     "請選擇帳號"
                 )
 
-
-            elif not email:
-
-                st.warning(
-                    "請輸入 Email"
-                )
+                return
 
 
-            elif not password:
+            if not password:
 
                 st.warning(
                     "請輸入密碼"
                 )
 
-
-            else:
-
-                expected_email = (
-                    USER_DB[
-                        username
-                    ][
-                        "email"
-                    ]
-                )
+                return
 
 
-                entered_email = (
-                    email
-                    .strip()
-                    .lower()
-                )
-
-
-                if entered_email != expected_email:
-
-                    st.error(
-                        "帳號、Email 或密碼錯誤"
-                    )
-
-
-                elif not verify_password(
-                    username,
-                    password
-                ):
-
-                    st.error(
-                        "帳號、Email 或密碼錯誤"
-                    )
-
-
-                else:
-
-                    now = datetime.now(
-                        TAIPEI_TZ
-                    )
-
-
-                    last_sent = (
-                        st.session_state
-                        .otp_last_sent_at
-                    )
-
-
-                    if last_sent:
-
-                        elapsed = (
-                            now
-                            - last_sent
-                        ).total_seconds()
-
-
-                        if (
-                            elapsed
-                            < OTP_RESEND_SECONDS
-                        ):
-
-                            remaining = int(
-                                OTP_RESEND_SECONDS
-                                - elapsed
-                            )
-
-
-                            st.warning(
-                                f"請等待 "
-                                f"{remaining} 秒後"
-                                "再重新寄送。"
-                            )
-
-                            st.stop()
-
-
-                    otp = generate_otp()
-
-
-                    try:
-
-                        send_otp_email(
-                            username,
-                            expected_email,
-                            otp,
-                        )
-
-
-                        st.session_state.otp_sent = True
-
-                        st.session_state.otp_code = otp
-
-                        st.session_state.otp_expire_at = (
-                            now
-                            + timedelta(
-                                minutes=(
-                                    OTP_EXPIRE_MINUTES
-                                )
-                            )
-                        )
-
-                        st.session_state.otp_last_sent_at = now
-
-                        st.session_state.otp_attempts = 0
-
-                        st.session_state.otp_account = username
-
-                        st.session_state.otp_email = expected_email
-
-
-                        st.success(
-                            "驗證碼已寄送至 "
-                            + mask_email(
-                                expected_email
-                            )
-                        )
-
-
-                    except Exception as e:
-
-                        st.error(
-                            f"寄送失敗：{e}"
-                        )
-
-
-        # ====================================================
-        # OTP AREA
-        # ====================================================
-
-        if st.session_state.otp_sent:
-
-            st.divider()
-
-            st.markdown(
-                "**Verification Code**"
-            )
-
-
-            st.caption(
-                "驗證碼有效時間 "
-                f"{OTP_EXPIRE_MINUTES} 分鐘"
-            )
-
-
-            otp_input = st.text_input(
-                "6-digit code",
-                max_chars=6,
-                placeholder="000000",
-            )
-
-
-            if st.button(
-                "VERIFY & LOGIN",
-                type="primary",
-                use_container_width=True,
+            if verify_password(
+                username,
+                password
             ):
-
-                now = datetime.now(
-                    TAIPEI_TZ
-                )
-
-
-                if (
-                    st.session_state
-                    .otp_account
-                    != username
-                ):
-
-                    st.error(
-                        "帳號已變更，"
-                        "請重新取得驗證碼。"
-                    )
-
-                    reset_otp()
-
-                    st.stop()
-
-
-                if (
-                    st.session_state
-                    .otp_email
-                    != email
-                    .strip()
-                    .lower()
-                ):
-
-                    st.error(
-                        "Email 已變更，"
-                        "請重新取得驗證碼。"
-                    )
-
-                    reset_otp()
-
-                    st.stop()
-
-
-                if (
-                    not verify_password(
-                        username,
-                        password
-                    )
-                ):
-
-                    st.error(
-                        "密碼錯誤，"
-                        "請重新取得驗證碼。"
-                    )
-
-                    reset_otp()
-
-                    st.stop()
-
-
-                if (
-                    now
-                    > st.session_state
-                    .otp_expire_at
-                ):
-
-                    st.error(
-                        "驗證碼已過期，"
-                        "請重新寄送。"
-                    )
-
-                    reset_otp()
-
-                    st.stop()
-
-
-                if (
-                    st.session_state
-                    .otp_attempts
-                    >= OTP_MAX_ATTEMPTS
-                ):
-
-                    st.error(
-                        "驗證次數已超過限制，"
-                        "請重新取得驗證碼。"
-                    )
-
-                    reset_otp()
-
-                    st.stop()
-
-
-                st.session_state.otp_attempts += 1
-
-
-                if not hmac.compare_digest(
-                    otp_input.strip(),
-                    st.session_state
-                    .otp_code
-                ):
-
-                    remaining = (
-                        OTP_MAX_ATTEMPTS
-                        - st.session_state
-                        .otp_attempts
-                    )
-
-
-                    st.error(
-                        "驗證碼錯誤。"
-                        f"剩餘 {remaining} 次。"
-                    )
-
-                    st.stop()
-
-
-                # ============================================
-                # LOGIN OK
-                # ============================================
 
                 st.session_state.authenticated = True
 
                 st.session_state.username = username
 
-
-                write_login_log(
-                    username=username,
-                    email=(
-                        USER_DB[
-                            username
-                        ][
-                            "email"
-                        ]
-                    ),
-                    success=True,
-                )
-
-
-                reset_otp()
-
                 st.rerun()
+
+
+            else:
+
+                st.error(
+                    "帳號或密碼錯誤"
+                )
 
 
 # ============================================================
@@ -1203,27 +622,47 @@ def show_admin_dashboard():
     if not logs:
 
         st.info(
-            "尚無使用紀錄，或 Supabase 未連線。"
+            "尚無使用紀錄，或 Supabase 尚未設定。"
         )
 
         return
 
 
-    df = pd.DataFrame(
-        logs
-    )
+    df = pd.DataFrame(logs)
 
+
+    # ========================================================
+    # TIME CONVERSION
+    # ========================================================
 
     if "started_at" in df.columns:
 
-        df[
-            "started_at"
-        ] = pd.to_datetime(
+        df["started_at"] = pd.to_datetime(
+
             df["started_at"],
+
             errors="coerce",
+
             utc=True,
+
         ).dt.tz_convert(
             "Asia/Taipei"
+        )
+
+
+        df["使用日期"] = (
+            df["started_at"]
+            .dt.strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+
+        df["使用時間"] = (
+            df["started_at"]
+            .dt.strftime(
+                "%H:%M:%S"
+            )
         )
 
 
@@ -1231,89 +670,175 @@ def show_admin_dashboard():
     # SUMMARY
     # ========================================================
 
-    if not df.empty:
+    summary = (
 
-        summary = (
-            df
-            .groupby(
-                "username"
-            )
-            .agg(
-                使用次數=(
-                    "id",
-                    "count"
-                ),
-                處理檔案數=(
-                    "file_count",
-                    "sum"
-                ),
-                成功數=(
-                    "success_count",
-                    "sum"
-                ),
-                失敗數=(
-                    "failed_count",
-                    "sum"
-                ),
-                總處理秒數=(
-                    "duration_seconds",
-                    "sum"
-                ),
-            )
-            .reset_index()
-        )
+        df
 
+        .groupby("username")
 
-        summary.rename(
-            columns={
-                "username":
-                "使用者"
-            },
-            inplace=True
-        )
+        .agg(
 
+            使用次數=(
+                "id",
+                "count"
+            ),
 
-        st.markdown(
-            "#### User Summary"
-        )
-
-
-        st.dataframe(
-            summary,
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-        st.markdown(
-            "#### Recent Activity"
-        )
-
-
-        columns = [
-            c
-            for c in [
-                "username",
-                "started_at",
+            處理檔案數=(
                 "file_count",
+                "sum"
+            ),
+
+            成功數=(
                 "success_count",
+                "sum"
+            ),
+
+            失敗數=(
                 "failed_count",
+                "sum"
+            ),
+
+            總處理秒數=(
                 "duration_seconds",
-                "app_version",
-            ]
-            if c in df.columns
+                "sum"
+            ),
+        )
+
+        .reset_index()
+    )
+
+
+    summary.rename(
+
+        columns={
+            "username": "使用者"
+        },
+
+        inplace=True
+    )
+
+
+    # ========================================================
+    # METRICS
+    # ========================================================
+
+    c1, c2, c3 = st.columns(3)
+
+
+    c1.metric(
+        "總使用次數",
+        len(df)
+    )
+
+
+    c2.metric(
+        "總處理檔案",
+        int(
+            df["file_count"].sum()
+        )
+    )
+
+
+    c3.metric(
+        "使用人數",
+        int(
+            df["username"].nunique()
+        )
+    )
+
+
+    st.markdown(
+        "#### USER SUMMARY"
+    )
+
+
+    st.dataframe(
+
+        summary,
+
+        use_container_width=True,
+
+        hide_index=True,
+    )
+
+
+    st.markdown(
+        "#### RECENT ACTIVITY"
+    )
+
+
+    display_columns = [
+
+        column
+
+        for column in [
+
+            "username",
+
+            "使用日期",
+
+            "使用時間",
+
+            "file_count",
+
+            "success_count",
+
+            "failed_count",
+
+            "duration_seconds",
+
+            "app_version",
+
         ]
 
+        if column in df.columns
+    ]
 
-        st.dataframe(
-            df[columns],
-            use_container_width=True,
-            hide_index=True,
-        )
+
+    display_df = df[
+        display_columns
+    ].copy()
+
+
+    display_df.rename(
+
+        columns={
+
+            "username":
+            "使用者",
+
+            "file_count":
+            "處理數量",
+
+            "success_count":
+            "成功",
+
+            "failed_count":
+            "失敗",
+
+            "duration_seconds":
+            "處理時間(秒)",
+
+            "app_version":
+            "版本",
+        },
+
+        inplace=True
+    )
+
+
+    st.dataframe(
+
+        display_df,
+
+        use_container_width=True,
+
+        hide_index=True,
+    )
 
 
 # ============================================================
-# RUN PROCESS
+# PROCESS FILES
 # ============================================================
 
 def run_process(
@@ -1326,12 +851,20 @@ def run_process(
     )
 
 
+    # ========================================================
+    # FIND WORD FILES
+    # ========================================================
+
     word_files = [
+
         f
+
         for f in uploaded_files
+
         if Path(
             f.name
         ).suffix.lower()
+
         in [
             ".doc",
             ".docx"
@@ -1339,49 +872,72 @@ def run_process(
     ]
 
 
+    # ========================================================
+    # FIND COVER FILES
+    # ========================================================
+
     cover_files = [
+
         f
+
         for f in uploaded_files
-        if Path(
-            f.name
-        ).suffix.lower()
-        == ".pdf"
-        and f.name.lower().startswith(
-            "cover-"
+
+        if (
+
+            Path(
+                f.name
+            ).suffix.lower()
+            == ".pdf"
+
+            and
+
+            f.name.lower().startswith(
+                "cover-"
+            )
         )
     ]
 
 
     cover_map = {
+
         f.name.lower(): f
+
         for f in cover_files
     }
 
 
-    total = len(
-        word_files
-    )
-
+    total = len(word_files)
 
     success = 0
+
     failed = 0
 
     result_files = []
 
 
+    # ========================================================
+    # UI
+    # ========================================================
+
     progress = st.progress(
+
         0,
-        text=(
-            "System Initializing..."
-        ),
+
+        text="SYSTEM INITIALIZING..."
     )
 
 
     status = st.status(
-        "PROCESSING",
+
+        "PROCESSING...",
+
         expanded=True,
     )
 
+
+    # ========================================================
+    # TEMP WORKSPACE
+    # ========================================================
 
     with tempfile.TemporaryDirectory() as tmp:
 
@@ -1389,8 +945,11 @@ def run_process(
 
 
         for index, word in enumerate(
+
             word_files,
-            start=1,
+
+            start=1
+
         ):
 
             base = Path(
@@ -1404,12 +963,15 @@ def run_process(
 
 
             status.write(
-                f"[{index}/{total}] "
-                f"{word.name}"
+                f"[{index}/{total}] {word.name}"
             )
 
 
             try:
+
+                # =================================================
+                # COVER CHECK
+                # =================================================
 
                 if (
                     expected_cover.lower()
@@ -1417,14 +979,15 @@ def run_process(
                 ):
 
                     raise FileNotFoundError(
+
                         "Cover not found: "
                         + expected_cover
                     )
 
 
-                # ============================================
+                # =================================================
                 # SAVE WORD
-                # ============================================
+                # =================================================
 
                 word_path = (
                     tmp
@@ -1437,14 +1000,13 @@ def run_process(
                 )
 
 
-                # ============================================
+                # =================================================
                 # SAVE COVER
-                # ============================================
+                # =================================================
 
                 cover_file = (
                     cover_map[
-                        expected_cover
-                        .lower()
+                        expected_cover.lower()
                     ]
                 )
 
@@ -1460,12 +1022,12 @@ def run_process(
                 )
 
 
-                # ============================================
+                # =================================================
                 # WORD → PDF
-                # ============================================
+                # =================================================
 
                 status.write(
-                    "→ Word → PDF"
+                    "→ Converting Word to PDF..."
                 )
 
 
@@ -1475,12 +1037,12 @@ def run_process(
                 )
 
 
-                # ============================================
-                # REPLACE COVER
-                # ============================================
+                # =================================================
+                # COVER REPLACEMENT
+                # =================================================
 
                 status.write(
-                    "→ Replace Cover Page"
+                    "→ Replacing Cover Page..."
                 )
 
 
@@ -1496,16 +1058,27 @@ def run_process(
 
 
                 replace_first_page(
+
                     cover_path,
+
                     main_pdf,
+
                     final_path,
                 )
 
 
+                # =================================================
+                # MEMORY
+                # =================================================
+
                 result_files.append(
+
                     (
+
                         final_name,
+
                         final_path.read_bytes(),
+
                     )
                 )
 
@@ -1514,8 +1087,7 @@ def run_process(
 
 
                 status.write(
-                    "✓ "
-                    + final_name
+                    f"✓ COMPLETE : {final_name}"
                 )
 
 
@@ -1525,8 +1097,7 @@ def run_process(
 
 
                 status.write(
-                    "✗ "
-                    + word.name
+                    f"✗ FAILED : {word.name}"
                 )
 
 
@@ -1535,17 +1106,21 @@ def run_process(
                 )
 
 
+            # =================================================
+            # PROGRESS
+            # =================================================
+
             percent = int(
-                (
-                    index
-                    / total
-                )
+                index
+                / total
                 * 100
             )
 
 
             progress.progress(
+
                 percent,
+
                 text=(
                     f"{index} / "
                     f"{total} "
@@ -1553,6 +1128,10 @@ def run_process(
                 ),
             )
 
+
+    # ========================================================
+    # FINISHED TIME
+    # ========================================================
 
     finished_at = datetime.now(
         TAIPEI_TZ
@@ -1581,6 +1160,10 @@ def run_process(
     )
 
 
+    # ========================================================
+    # SESSION RESULTS
+    # ========================================================
+
     st.session_state.result_files = (
         result_files
     )
@@ -1607,30 +1190,49 @@ def run_process(
 
 
     # ========================================================
-    # DATABASE LOG
+    # USAGE LOG
     # ========================================================
 
     log_ok, log_error = write_usage_log(
+
         username=username,
+
         started_at=started_at,
+
         finished_at=finished_at,
+
         file_count=total,
+
         success_count=success,
+
         failed_count=failed,
     )
 
 
+    # ========================================================
+    # STATUS COMPLETE
+    # ========================================================
+
     status.update(
+
         label=(
-            "COMPLETED "
-            f"| Success: {success} "
-            f"| Failed: {failed}"
+
+            "PROCESS COMPLETE "
+
+            f"| SUCCESS: {success} "
+
+            f"| FAILED: {failed}"
         ),
+
         state=(
+
             "complete"
+
             if failed == 0
+
             else "error"
         ),
+
         expanded=True,
     )
 
@@ -1638,15 +1240,15 @@ def run_process(
     if not log_ok:
 
         st.warning(
-            "PDF 已完成，但後台紀錄失敗："
-            + str(
-                log_error
-            )
+
+            "PDF 已完成，但使用紀錄未寫入："
+
+            + str(log_error)
         )
 
 
 # ============================================================
-# DOWNLOAD
+# DOWNLOAD RESULTS
 # ============================================================
 
 def show_download_results():
@@ -1663,70 +1265,85 @@ def show_download_results():
     )
 
 
-    c1, c2, c3 = st.columns(
-        3
-    )
+    c1, c2, c3 = st.columns(3)
 
 
     c1.metric(
-        "Total",
+        "TOTAL",
         st.session_state.last_total
     )
 
 
     c2.metric(
-        "Success",
+        "SUCCESS",
         st.session_state.last_success
     )
 
 
     c3.metric(
-        "Failed",
+        "FAILED",
         st.session_state.last_failed
     )
 
 
+    # ========================================================
+    # DOWNLOAD ZIP
+    # ========================================================
+
     st.download_button(
+
         label=(
             "DOWNLOAD ALL "
             f"({st.session_state.last_success} FILES)"
         ),
+
         data=(
             st.session_state.result_zip
         ),
+
         file_name=(
-            st.session_state
-            .result_zip_name
+            st.session_state.result_zip_name
         ),
+
         mime="application/zip",
+
         type="primary",
+
         use_container_width=True,
     )
 
 
+    # ========================================================
+    # INDIVIDUAL FILE DOWNLOADS
+    # ========================================================
+
     with st.expander(
-        "Individual PDF Downloads"
+        "INDIVIDUAL PDF DOWNLOADS"
     ):
 
         for filename, data in (
-            st.session_state
-            .result_files
+            st.session_state.result_files
         ):
 
             st.download_button(
+
                 label=filename,
+
                 data=data,
+
                 file_name=filename,
+
                 mime="application/pdf",
+
                 key=(
-                    "dl_"
+                    "download_"
                     + filename
                 ),
             )
 
 
 # ============================================================
-# MAIN PAGE
+# MAIN APP
 # ============================================================
 
 def show_main_app():
@@ -1735,6 +1352,10 @@ def show_main_app():
         st.session_state.username
     )
 
+
+    # ========================================================
+    # HEADER
+    # ========================================================
 
     col1, col2 = st.columns(
         [4, 1]
@@ -1761,13 +1382,16 @@ def show_main_app():
     with col2:
 
         st.write(
-            f"User: **{username}**"
+            f"USER : **{username}**"
         )
 
 
         if st.button(
+
             "LOGOUT",
+
             use_container_width=True
+
         ):
 
             st.session_state.authenticated = False
@@ -1780,50 +1404,73 @@ def show_main_app():
 
             st.session_state.result_zip_name = None
 
-            reset_otp()
-
             st.rerun()
 
 
     st.divider()
 
 
+    # ========================================================
+    # INSTRUCTIONS
+    # ========================================================
+
     st.markdown(
         """
-        ### PDF Cover Replacement
+        ### PDF COVER REPLACEMENT
 
-        將所有 Word 與 Cover PDF 一次拖進下方。
+        將 **Word + Cover PDF** 一次全部拖入。
 
         命名規則：
 
-        `DOC-001.docx`
+        ```
+        DOC-2026-00100.docx
 
-        對應：
+        cover-DOC-2026-00100.pdf
+        ```
 
-        `cover-DOC-001.pdf`
+        系統會產生：
+
+        ```
+        DOC-2026-00100-Final.pdf
+        ```
         """
     )
 
 
+    # ========================================================
+    # FILE UPLOAD
+    # ========================================================
+
     uploaded_files = st.file_uploader(
+
         "DROP WORD + COVER PDF FILES HERE",
+
         type=[
             "doc",
             "docx",
             "pdf"
         ],
+
         accept_multiple_files=True,
     )
 
 
+    # ========================================================
+    # FILE MAPPING
+    # ========================================================
+
     if uploaded_files:
 
         word_files = [
+
             f
+
             for f in uploaded_files
+
             if Path(
                 f.name
             ).suffix.lower()
+
             in [
                 ".doc",
                 ".docx"
@@ -1832,20 +1479,31 @@ def show_main_app():
 
 
         cover_files = [
+
             f
+
             for f in uploaded_files
-            if Path(
-                f.name
-            ).suffix.lower()
-            == ".pdf"
-            and f.name.lower().startswith(
-                "cover-"
+
+            if (
+
+                Path(
+                    f.name
+                ).suffix.lower()
+                == ".pdf"
+
+                and
+
+                f.name.lower().startswith(
+                    "cover-"
+                )
             )
         ]
 
 
         cover_names = {
+
             f.name.lower()
+
             for f in cover_files
         }
 
@@ -1867,17 +1525,20 @@ def show_main_app():
 
             preview.append(
                 {
-                    "Word":
+
+                    "WORD FILE":
                     word.name,
 
-                    "Expected Cover":
+                    "EXPECTED COVER":
                     expected,
 
-                    "Status":
+                    "STATUS":
                     (
                         "OK"
+
                         if expected.lower()
                         in cover_names
+
                         else "MISSING"
                     )
                 }
@@ -1890,67 +1551,95 @@ def show_main_app():
 
 
         st.dataframe(
+
             preview,
+
             use_container_width=True,
+
             hide_index=True,
         )
 
 
         missing_count = sum(
+
             1
+
             for row in preview
-            if row["Status"]
+
+            if row["STATUS"]
             == "MISSING"
         )
 
 
-        c1, c2, c3 = st.columns(
-            3
-        )
+        # ====================================================
+        # METRICS
+        # ====================================================
+
+        c1, c2, c3 = st.columns(3)
 
 
         c1.metric(
-            "Word",
+            "WORD",
             len(word_files)
         )
 
 
         c2.metric(
-            "Cover",
+            "COVER",
             len(cover_files)
         )
 
 
         c3.metric(
-            "Missing Cover",
+            "MISSING COVER",
             missing_count
         )
 
 
+        # ====================================================
+        # START
+        # ====================================================
+
         start_disabled = (
+
             len(word_files) == 0
-            or missing_count > 0
+
+            or
+
+            missing_count > 0
         )
 
 
         if st.button(
+
             "START PROCESS",
+
             type="primary",
+
             use_container_width=True,
+
             disabled=start_disabled,
+
         ):
 
             run_process(
+
                 username,
+
                 uploaded_files,
             )
 
+
+    # ========================================================
+    # DOWNLOAD
+    # ========================================================
 
     show_download_results()
 
 
     # ========================================================
-    # DENNY ADMIN
+    # ADMIN
+    # ONLY DENNY
     # ========================================================
 
     if username == "Denny":
@@ -1959,14 +1648,14 @@ def show_main_app():
 
 
         with st.expander(
-            "ADMIN / Usage History"
+            "ADMIN / USAGE HISTORY"
         ):
 
             show_admin_dashboard()
 
 
 # ============================================================
-# START APP
+# APP START
 # ============================================================
 
 if not st.session_state.authenticated:
