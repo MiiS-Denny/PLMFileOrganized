@@ -1,5 +1,6 @@
 import io
 import hmac
+import re
 import zipfile
 import subprocess
 import tempfile
@@ -8,8 +9,6 @@ from pathlib import Path
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-import pandas as pd
-import requests
 import streamlit as st
 from pypdf import PdfReader, PdfWriter
 
@@ -19,7 +18,7 @@ from pypdf import PdfReader, PdfWriter
 # ============================================================
 
 APP_NAME = "PLM PDF Automation Tool"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
@@ -38,7 +37,6 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-
     .block-container {
         max-width: 1200px;
         padding-top: 1.8rem;
@@ -56,18 +54,11 @@ st.markdown(
         margin-bottom: 18px;
     }
 
-    .system-tag {
-        font-family: monospace;
-        font-size: 13px;
-        color: #666;
-    }
-
     div[data-testid="stMetric"] {
         border: 1px solid #d9d9d9;
         border-radius: 6px;
         padding: 12px;
     }
-
     </style>
     """,
     unsafe_allow_html=True,
@@ -81,11 +72,9 @@ st.markdown(
 DEFAULT_SESSION = {
     "authenticated": False,
     "username": None,
-
     "result_files": [],
     "result_zip": None,
     "result_zip_name": None,
-
     "last_success": 0,
     "last_failed": 0,
     "last_total": 0,
@@ -99,24 +88,16 @@ for key, value in DEFAULT_SESSION.items():
 
 # ============================================================
 # USER DATABASE
-#
-# Streamlit Secrets:
-#
-# [users.Charles]
-# password = "A00027"
-#
 # ============================================================
 
 def get_user_db():
 
     try:
-
         users = st.secrets["users"]
 
         result = {}
 
         for username, data in users.items():
-
             result[username] = {
                 "password": str(data["password"]).strip()
             }
@@ -124,20 +105,13 @@ def get_user_db():
         return result
 
     except Exception as e:
-
         st.error("無法讀取使用者設定。")
-
         st.code(str(e))
-
         st.stop()
 
 
 USER_DB = get_user_db()
 
-
-# ============================================================
-# PASSWORD VERIFY
-# ============================================================
 
 def verify_password(username, password):
 
@@ -145,7 +119,6 @@ def verify_password(username, password):
         return False
 
     expected = USER_DB[username]["password"]
-
     entered = str(password).strip()
 
     return hmac.compare_digest(
@@ -155,182 +128,88 @@ def verify_password(username, password):
 
 
 # ============================================================
-# SUPABASE CONFIG
+# DOCUMENT NUMBER DETECTION
 # ============================================================
 
-def get_supabase_config():
+DOC_PATTERNS = [
+    r"\bDOC[-\s_]?(\d{4})[-\s_]?(\d{5})\b",
+]
 
-    try:
 
-        url = str(
-            st.secrets["supabase"]["url"]
-        ).rstrip("/")
+def normalize_document_number(text):
 
-        key = str(
-            st.secrets["supabase"]["service_role_key"]
+    if not text:
+        return None
+
+    text = text.upper()
+
+    for pattern in DOC_PATTERNS:
+
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE
         )
 
-        return url, key
+        if match:
 
-    except Exception:
+            year = match.group(1)
+            number = match.group(2)
 
-        return None, None
+            return f"DOC-{year}-{number}"
 
-
-# ============================================================
-# WRITE USAGE LOG
-# ============================================================
-
-def write_usage_log(
-    username,
-    started_at,
-    finished_at,
-    file_count,
-    success_count,
-    failed_count,
-):
-
-    url, key = get_supabase_config()
-
-    if not url or not key:
-
-        return False, "Supabase 尚未設定"
-
-
-    duration = (
-        finished_at - started_at
-    ).total_seconds()
-
-
-    payload = {
-
-        "username": username,
-
-        "started_at": started_at.isoformat(),
-
-        "finished_at": finished_at.isoformat(),
-
-        "file_count": int(file_count),
-
-        "success_count": int(success_count),
-
-        "failed_count": int(failed_count),
-
-        "duration_seconds": round(
-            duration,
-            2
-        ),
-
-        "app_version": APP_VERSION,
-    }
-
-
-    headers = {
-
-        "apikey": key,
-
-        "Authorization": f"Bearer {key}",
-
-        "Content-Type": "application/json",
-
-        "Prefer": "return=minimal",
-    }
-
-
-    try:
-
-        response = requests.post(
-
-            f"{url}/rest/v1/usage_log",
-
-            headers=headers,
-
-            json=payload,
-
-            timeout=15,
-        )
-
-
-        if response.status_code in [
-            200,
-            201,
-            204
-        ]:
-
-            return True, None
-
-
-        return (
-            False,
-            f"HTTP {response.status_code}: {response.text}"
-        )
-
-
-    except Exception as e:
-
-        return False, str(e)
+    return None
 
 
 # ============================================================
-# READ USAGE LOG
+# PDF TEXT EXTRACTION
 # ============================================================
 
-def read_usage_logs(limit=1000):
+def extract_pdf_text(pdf_path, max_pages=3):
 
-    url, key = get_supabase_config()
+    reader = PdfReader(
+        str(pdf_path)
+    )
 
-    if not url or not key:
-        return []
+    text_parts = []
 
+    page_count = min(
+        len(reader.pages),
+        max_pages
+    )
 
-    headers = {
+    for i in range(page_count):
 
-        "apikey": key,
+        try:
 
-        "Authorization": f"Bearer {key}",
-    }
+            text = (
+                reader.pages[i]
+                .extract_text()
+                or ""
+            )
 
+            text_parts.append(text)
 
-    params = {
+        except Exception:
+            pass
 
-        "select": "*",
-
-        "order": "started_at.desc",
-
-        "limit": limit,
-    }
-
-
-    try:
-
-        response = requests.get(
-
-            f"{url}/rest/v1/usage_log",
-
-            headers=headers,
-
-            params=params,
-
-            timeout=15,
-        )
+    return "\n".join(text_parts)
 
 
-        if response.status_code == 200:
+def detect_doc_number_from_pdf(pdf_path):
 
-            return response.json()
+    text = extract_pdf_text(
+        pdf_path,
+        max_pages=3
+    )
 
-
-    except Exception:
-
-        pass
-
-
-    return []
+    return normalize_document_number(
+        text
+    )
 
 
 # ============================================================
 # WORD → PDF
-# LibreOffice Headless
 # ============================================================
 
 def word_to_pdf(
@@ -338,37 +217,27 @@ def word_to_pdf(
     output_dir
 ):
 
-    output_dir = Path(output_dir)
+    output_dir = Path(
+        output_dir
+    )
 
 
     command = [
-
         "libreoffice",
-
         "--headless",
-
         "--convert-to",
-
         "pdf",
-
         "--outdir",
-
         str(output_dir),
-
         str(word_path),
     ]
 
 
     result = subprocess.run(
-
         command,
-
         stdout=subprocess.PIPE,
-
         stderr=subprocess.PIPE,
-
         text=True,
-
         timeout=180,
     )
 
@@ -393,10 +262,6 @@ def word_to_pdf(
 
 # ============================================================
 # REPLACE FIRST PAGE
-#
-# Cover PDF 第一頁
-# +
-# Word PDF 第 2 頁以後
 # ============================================================
 
 def replace_first_page(
@@ -417,33 +282,27 @@ def replace_first_page(
     if len(cover_reader.pages) != 1:
 
         raise RuntimeError(
-            "Cover PDF 必須只有 1 頁"
+            "Signed Cover PDF 必須只有 1 頁"
         )
 
 
     if len(main_reader.pages) < 1:
 
         raise RuntimeError(
-            "Word PDF 沒有任何頁面"
+            "Word PDF 沒有頁面"
         )
 
 
     writer = PdfWriter()
 
 
-    # --------------------------------------------------------
-    # NEW COVER
-    # --------------------------------------------------------
-
+    # New cover
     writer.add_page(
         cover_reader.pages[0]
     )
 
 
-    # --------------------------------------------------------
-    # ORIGINAL PDF PAGE 2 ~ END
-    # --------------------------------------------------------
-
+    # Original page 2 ~ end
     for page_index in range(
         1,
         len(main_reader.pages)
@@ -465,7 +324,7 @@ def replace_first_page(
 
 
 # ============================================================
-# CREATE ZIP
+# ZIP
 # ============================================================
 
 def create_zip(result_files):
@@ -474,13 +333,9 @@ def create_zip(result_files):
 
 
     with zipfile.ZipFile(
-
         zip_buffer,
-
         "w",
-
         zipfile.ZIP_DEFLATED,
-
     ) as zf:
 
         for filename, data in result_files:
@@ -497,7 +352,7 @@ def create_zip(result_files):
 
 
 # ============================================================
-# LOGIN PAGE
+# LOGIN
 # ============================================================
 
 def show_login():
@@ -529,43 +384,27 @@ def show_login():
         )
 
 
-        st.caption(
-            "Authorized Personnel Only"
-        )
-
-
         username = st.selectbox(
-
             "Account",
-
             options=sorted(
                 USER_DB.keys()
             ),
-
             index=None,
-
             placeholder="Select account",
         )
 
 
         password = st.text_input(
-
             "Password / Employee ID",
-
             type="password",
-
             placeholder="Enter employee ID",
         )
 
 
         if st.button(
-
             "LOGIN",
-
             type="primary",
-
             use_container_width=True,
-
         ):
 
             if not username:
@@ -592,11 +431,8 @@ def show_login():
             ):
 
                 st.session_state.authenticated = True
-
                 st.session_state.username = username
-
                 st.rerun()
-
 
             else:
 
@@ -606,448 +442,494 @@ def show_login():
 
 
 # ============================================================
-# ADMIN DASHBOARD
+# ANALYZE FILES
 # ============================================================
 
-def show_admin_dashboard():
+def analyze_uploaded_files(
+    uploaded_files
+):
 
-    st.subheader(
-        "SYSTEM USAGE DASHBOARD"
+    word_files = []
+
+    pdf_files = []
+
+
+    for f in uploaded_files:
+
+        suffix = Path(
+            f.name
+        ).suffix.lower()
+
+
+        if suffix in [
+            ".doc",
+            ".docx"
+        ]:
+
+            word_files.append(f)
+
+
+        elif suffix == ".pdf":
+
+            pdf_files.append(f)
+
+
+    return word_files, pdf_files
+
+
+# ============================================================
+# BUILD MATCHING PREVIEW
+# ============================================================
+
+def build_matching_preview(
+    uploaded_files
+):
+
+    word_files, pdf_files = (
+        analyze_uploaded_files(
+            uploaded_files
+        )
     )
 
 
-    logs = read_usage_logs()
+    rows = []
+
+    errors = []
 
 
-    if not logs:
+    # --------------------------------------------------------
+    # Basic count check
+    # --------------------------------------------------------
 
-        st.info(
-            "尚無使用紀錄，或 Supabase 尚未設定。"
+    if len(word_files) != len(pdf_files):
+
+        errors.append(
+            (
+                "數量不一致："
+                f"Word = {len(word_files)}，"
+                f"Signed Cover PDF = {len(pdf_files)}"
+            )
+        )
+
+
+    if len(word_files) == 0:
+
+        errors.append(
+            "沒有找到 Word 檔案"
+        )
+
+
+    if len(pdf_files) == 0:
+
+        errors.append(
+            "沒有找到 Signed Cover PDF"
+        )
+
+
+    return (
+        word_files,
+        pdf_files,
+        rows,
+        errors
+    )
+
+
+# ============================================================
+# PROCESS
+# ============================================================
+
+def run_process(
+    uploaded_files
+):
+
+    word_files, cover_files = (
+        analyze_uploaded_files(
+            uploaded_files
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Count validation
+    # --------------------------------------------------------
+
+    if len(word_files) != len(cover_files):
+
+        st.error(
+            "無法開始：Word 與 Signed Cover PDF 數量不一致。"
         )
 
         return
 
 
-    df = pd.DataFrame(logs)
-
-
-    # ========================================================
-    # TIME CONVERSION
-    # ========================================================
-
-    if "started_at" in df.columns:
-
-        df["started_at"] = pd.to_datetime(
-
-            df["started_at"],
-
-            errors="coerce",
-
-            utc=True,
-
-        ).dt.tz_convert(
-            "Asia/Taipei"
-        )
-
-
-        df["使用日期"] = (
-            df["started_at"]
-            .dt.strftime(
-                "%Y-%m-%d"
-            )
-        )
-
-
-        df["使用時間"] = (
-            df["started_at"]
-            .dt.strftime(
-                "%H:%M:%S"
-            )
-        )
-
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    summary = (
-
-        df
-
-        .groupby("username")
-
-        .agg(
-
-            使用次數=(
-                "id",
-                "count"
-            ),
-
-            處理檔案數=(
-                "file_count",
-                "sum"
-            ),
-
-            成功數=(
-                "success_count",
-                "sum"
-            ),
-
-            失敗數=(
-                "failed_count",
-                "sum"
-            ),
-
-            總處理秒數=(
-                "duration_seconds",
-                "sum"
-            ),
-        )
-
-        .reset_index()
-    )
-
-
-    summary.rename(
-
-        columns={
-            "username": "使用者"
-        },
-
-        inplace=True
-    )
-
-
-    # ========================================================
-    # METRICS
-    # ========================================================
-
-    c1, c2, c3 = st.columns(3)
-
-
-    c1.metric(
-        "總使用次數",
-        len(df)
-    )
-
-
-    c2.metric(
-        "總處理檔案",
-        int(
-            df["file_count"].sum()
-        )
-    )
-
-
-    c3.metric(
-        "使用人數",
-        int(
-            df["username"].nunique()
-        )
-    )
-
-
-    st.markdown(
-        "#### USER SUMMARY"
-    )
-
-
-    st.dataframe(
-
-        summary,
-
-        use_container_width=True,
-
-        hide_index=True,
-    )
-
-
-    st.markdown(
-        "#### RECENT ACTIVITY"
-    )
-
-
-    display_columns = [
-
-        column
-
-        for column in [
-
-            "username",
-
-            "使用日期",
-
-            "使用時間",
-
-            "file_count",
-
-            "success_count",
-
-            "failed_count",
-
-            "duration_seconds",
-
-            "app_version",
-
-        ]
-
-        if column in df.columns
-    ]
-
-
-    display_df = df[
-        display_columns
-    ].copy()
-
-
-    display_df.rename(
-
-        columns={
-
-            "username":
-            "使用者",
-
-            "file_count":
-            "處理數量",
-
-            "success_count":
-            "成功",
-
-            "failed_count":
-            "失敗",
-
-            "duration_seconds":
-            "處理時間(秒)",
-
-            "app_version":
-            "版本",
-        },
-
-        inplace=True
-    )
-
-
-    st.dataframe(
-
-        display_df,
-
-        use_container_width=True,
-
-        hide_index=True,
-    )
-
-
-# ============================================================
-# PROCESS FILES
-# ============================================================
-
-def run_process(
-    username,
-    uploaded_files,
-):
-
-    started_at = datetime.now(
-        TAIPEI_TZ
-    )
-
-
-    # ========================================================
-    # FIND WORD FILES
-    # ========================================================
-
-    word_files = [
-
-        f
-
-        for f in uploaded_files
-
-        if Path(
-            f.name
-        ).suffix.lower()
-
-        in [
-            ".doc",
-            ".docx"
-        ]
-    ]
-
-
-    # ========================================================
-    # FIND COVER FILES
-    # ========================================================
-
-    cover_files = [
-
-        f
-
-        for f in uploaded_files
-
-        if (
-
-            Path(
-                f.name
-            ).suffix.lower()
-            == ".pdf"
-
-            and
-
-            f.name.lower().startswith(
-                "cover-"
-            )
-        )
-    ]
-
-
-    cover_map = {
-
-        f.name.lower(): f
-
-        for f in cover_files
-    }
-
-
     total = len(word_files)
 
-    success = 0
-
-    failed = 0
-
-    result_files = []
-
-
-    # ========================================================
-    # UI
-    # ========================================================
-
     progress = st.progress(
-
         0,
-
         text="SYSTEM INITIALIZING..."
     )
 
 
     status = st.status(
-
-        "PROCESSING...",
-
+        "ANALYZING FILES...",
         expanded=True,
     )
 
 
-    # ========================================================
-    # TEMP WORKSPACE
-    # ========================================================
+    result_files = []
+
+    success = 0
+    failed = 0
+
 
     with tempfile.TemporaryDirectory() as tmp:
 
         tmp = Path(tmp)
 
 
-        for index, word in enumerate(
+        # ====================================================
+        # STEP 1
+        # SAVE + ANALYZE COVERS
+        # ====================================================
 
-            word_files,
+        cover_map = {}
 
-            start=1
-
-        ):
-
-            base = Path(
-                word.name
-            ).stem
+        status.write(
+            "→ Reading Signed Cover PDFs..."
+        )
 
 
-            expected_cover = (
-                f"cover-{base}.pdf"
+        for cover in cover_files:
+
+            cover_path = (
+                tmp
+                / cover.name
             )
 
 
-            status.write(
-                f"[{index}/{total}] {word.name}"
+            cover_path.write_bytes(
+                cover.getvalue()
             )
 
 
             try:
 
-                # =================================================
-                # COVER CHECK
-                # =================================================
+                reader = PdfReader(
+                    str(cover_path)
+                )
 
-                if (
-                    expected_cover.lower()
-                    not in cover_map
-                ):
+                if len(reader.pages) != 1:
 
-                    raise FileNotFoundError(
-
-                        "Cover not found: "
-                        + expected_cover
+                    raise RuntimeError(
+                        (
+                            f"{cover.name} "
+                            "不是單頁 PDF"
+                        )
                     )
 
 
-                # =================================================
-                # SAVE WORD
-                # =================================================
-
-                word_path = (
-                    tmp
-                    / word.name
+                doc_no = (
+                    detect_doc_number_from_pdf(
+                        cover_path
+                    )
                 )
 
 
-                word_path.write_bytes(
-                    word.getvalue()
-                )
+                if not doc_no:
+
+                    raise RuntimeError(
+                        (
+                            f"{cover.name} "
+                            "找不到 DOC 文件編號"
+                        )
+                    )
 
 
-                # =================================================
-                # SAVE COVER
-                # =================================================
+                if doc_no in cover_map:
 
-                cover_file = (
-                    cover_map[
-                        expected_cover.lower()
-                    ]
-                )
-
-
-                cover_path = (
-                    tmp
-                    / expected_cover
-                )
+                    raise RuntimeError(
+                        (
+                            "Signed Cover 文件編號重複："
+                            f"{doc_no}"
+                        )
+                    )
 
 
-                cover_path.write_bytes(
-                    cover_file.getvalue()
-                )
+                cover_map[
+                    doc_no
+                ] = {
+                    "upload": cover,
+                    "path": cover_path,
+                    "name": cover.name,
+                }
 
-
-                # =================================================
-                # WORD → PDF
-                # =================================================
 
                 status.write(
-                    "→ Converting Word to PDF..."
+                    (
+                        f"✓ COVER : "
+                        f"{cover.name}"
+                        f" → {doc_no}"
+                    )
                 )
 
 
-                main_pdf = word_to_pdf(
+            except Exception as e:
+
+                status.update(
+                    label="ANALYSIS FAILED",
+                    state="error",
+                    expanded=True,
+                )
+
+                st.error(str(e))
+
+                return
+
+
+        # ====================================================
+        # STEP 2
+        # SAVE + CONVERT + ANALYZE WORD
+        # ====================================================
+
+        word_map = {}
+
+
+        status.write(
+            "→ Converting and analyzing Word files..."
+        )
+
+
+        for word in word_files:
+
+            word_path = (
+                tmp
+                / word.name
+            )
+
+
+            word_path.write_bytes(
+                word.getvalue()
+            )
+
+
+            try:
+
+                pdf_path = word_to_pdf(
                     word_path,
                     tmp
                 )
 
 
-                # =================================================
-                # COVER REPLACEMENT
-                # =================================================
+                doc_no = (
+                    detect_doc_number_from_pdf(
+                        pdf_path
+                    )
+                )
+
+
+                if not doc_no:
+
+                    raise RuntimeError(
+                        (
+                            f"{word.name} "
+                            "找不到 DOC 文件編號"
+                        )
+                    )
+
+
+                if doc_no in word_map:
+
+                    raise RuntimeError(
+                        (
+                            "Word 文件編號重複："
+                            f"{doc_no}"
+                        )
+                    )
+
+
+                word_map[
+                    doc_no
+                ] = {
+                    "upload": word,
+                    "word_path": word_path,
+                    "pdf_path": pdf_path,
+                    "name": word.name,
+                }
+
 
                 status.write(
-                    "→ Replacing Cover Page..."
+                    (
+                        f"✓ WORD : "
+                        f"{word.name}"
+                        f" → {doc_no}"
+                    )
+                )
+
+
+            except Exception as e:
+
+                status.update(
+                    label="ANALYSIS FAILED",
+                    state="error",
+                    expanded=True,
+                )
+
+                st.error(str(e))
+
+                return
+
+
+        # ====================================================
+        # STEP 3
+        # MATCH VALIDATION
+        # ====================================================
+
+        cover_keys = set(
+            cover_map.keys()
+        )
+
+        word_keys = set(
+            word_map.keys()
+        )
+
+
+        missing_cover = (
+            word_keys
+            - cover_keys
+        )
+
+
+        missing_word = (
+            cover_keys
+            - word_keys
+        )
+
+
+        if missing_cover or missing_word:
+
+            status.update(
+                label="MATCHING FAILED",
+                state="error",
+                expanded=True,
+            )
+
+
+            if missing_cover:
+
+                st.error(
+                    (
+                        "以下 Word 找不到對應 Signed Cover：\n\n"
+                        + "\n".join(
+                            sorted(
+                                missing_cover
+                            )
+                        )
+                    )
+                )
+
+
+            if missing_word:
+
+                st.error(
+                    (
+                        "以下 Signed Cover 找不到對應 Word：\n\n"
+                        + "\n".join(
+                            sorted(
+                                missing_word
+                            )
+                        )
+                    )
+                )
+
+
+            return
+
+
+        # ====================================================
+        # MATCHING PREVIEW
+        # ====================================================
+
+        mapping_rows = []
+
+
+        for doc_no in sorted(
+            word_keys
+        ):
+
+            mapping_rows.append(
+                {
+                    "DOCUMENT NO.":
+                    doc_no,
+
+                    "WORD FILE":
+                    word_map[
+                        doc_no
+                    ][
+                        "name"
+                    ],
+
+                    "SIGNED COVER":
+                    cover_map[
+                        doc_no
+                    ][
+                        "name"
+                    ],
+
+                    "STATUS":
+                    "MATCHED",
+                }
+            )
+
+
+        st.markdown(
+            "### AUTO MATCHING RESULT"
+        )
+
+
+        st.dataframe(
+            mapping_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+        # ====================================================
+        # STEP 4
+        # CREATE FINAL PDF
+        # ====================================================
+
+        status.write(
+            "→ Replacing cover pages..."
+        )
+
+
+        for index, doc_no in enumerate(
+            sorted(word_keys),
+            start=1
+        ):
+
+            try:
+
+                main_pdf = (
+                    word_map[
+                        doc_no
+                    ][
+                        "pdf_path"
+                    ]
+                )
+
+
+                cover_pdf = (
+                    cover_map[
+                        doc_no
+                    ][
+                        "path"
+                    ]
                 )
 
 
                 final_name = (
-                    f"{base}-Final.pdf"
+                    f"{doc_no}-Final.pdf"
                 )
 
 
@@ -1058,27 +940,16 @@ def run_process(
 
 
                 replace_first_page(
-
-                    cover_path,
-
+                    cover_pdf,
                     main_pdf,
-
                     final_path,
                 )
 
 
-                # =================================================
-                # MEMORY
-                # =================================================
-
                 result_files.append(
-
                     (
-
                         final_name,
-
                         final_path.read_bytes(),
-
                     )
                 )
 
@@ -1087,7 +958,10 @@ def run_process(
 
 
                 status.write(
-                    f"✓ COMPLETE : {final_name}"
+                    (
+                        f"✓ [{index}/{total}] "
+                        f"{final_name}"
+                    )
                 )
 
 
@@ -1097,18 +971,13 @@ def run_process(
 
 
                 status.write(
-                    f"✗ FAILED : {word.name}"
+                    (
+                        f"✗ [{index}/{total}] "
+                        f"{doc_no}: "
+                        f"{e}"
+                    )
                 )
 
-
-                status.write(
-                    str(e)
-                )
-
-
-            # =================================================
-            # PROGRESS
-            # =================================================
 
             percent = int(
                 index
@@ -1118,9 +987,7 @@ def run_process(
 
 
             progress.progress(
-
                 percent,
-
                 text=(
                     f"{index} / "
                     f"{total} "
@@ -1130,17 +997,13 @@ def run_process(
 
 
     # ========================================================
-    # FINISHED TIME
+    # ZIP
     # ========================================================
 
     finished_at = datetime.now(
         TAIPEI_TZ
     )
 
-
-    # ========================================================
-    # ZIP
-    # ========================================================
 
     timestamp = (
         finished_at.strftime(
@@ -1159,10 +1022,6 @@ def run_process(
         result_files
     )
 
-
-    # ========================================================
-    # SESSION RESULTS
-    # ========================================================
 
     st.session_state.result_files = (
         result_files
@@ -1189,66 +1048,23 @@ def run_process(
     )
 
 
-    # ========================================================
-    # USAGE LOG
-    # ========================================================
-
-    log_ok, log_error = write_usage_log(
-
-        username=username,
-
-        started_at=started_at,
-
-        finished_at=finished_at,
-
-        file_count=total,
-
-        success_count=success,
-
-        failed_count=failed,
-    )
-
-
-    # ========================================================
-    # STATUS COMPLETE
-    # ========================================================
-
     status.update(
-
         label=(
-
             "PROCESS COMPLETE "
-
             f"| SUCCESS: {success} "
-
             f"| FAILED: {failed}"
         ),
-
         state=(
-
             "complete"
-
             if failed == 0
-
             else "error"
         ),
-
         expanded=True,
     )
 
 
-    if not log_ok:
-
-        st.warning(
-
-            "PDF 已完成，但使用紀錄未寫入："
-
-            + str(log_error)
-        )
-
-
 # ============================================================
-# DOWNLOAD RESULTS
+# DOWNLOAD
 # ============================================================
 
 def show_download_results():
@@ -1259,13 +1075,14 @@ def show_download_results():
 
     st.divider()
 
-
     st.subheader(
         "OUTPUT"
     )
 
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3 = st.columns(
+        3
+    )
 
 
     c1.metric(
@@ -1286,36 +1103,22 @@ def show_download_results():
     )
 
 
-    # ========================================================
-    # DOWNLOAD ZIP
-    # ========================================================
-
     st.download_button(
-
         label=(
             "DOWNLOAD ALL "
             f"({st.session_state.last_success} FILES)"
         ),
-
         data=(
             st.session_state.result_zip
         ),
-
         file_name=(
             st.session_state.result_zip_name
         ),
-
         mime="application/zip",
-
         type="primary",
-
         use_container_width=True,
     )
 
-
-    # ========================================================
-    # INDIVIDUAL FILE DOWNLOADS
-    # ========================================================
 
     with st.expander(
         "INDIVIDUAL PDF DOWNLOADS"
@@ -1326,15 +1129,10 @@ def show_download_results():
         ):
 
             st.download_button(
-
                 label=filename,
-
                 data=data,
-
                 file_name=filename,
-
                 mime="application/pdf",
-
                 key=(
                     "download_"
                     + filename
@@ -1343,7 +1141,7 @@ def show_download_results():
 
 
 # ============================================================
-# MAIN APP
+# MAIN
 # ============================================================
 
 def show_main_app():
@@ -1352,10 +1150,6 @@ def show_main_app():
         st.session_state.username
     )
 
-
-    # ========================================================
-    # HEADER
-    # ========================================================
 
     col1, col2 = st.columns(
         [4, 1]
@@ -1387,21 +1181,15 @@ def show_main_app():
 
 
         if st.button(
-
             "LOGOUT",
-
             use_container_width=True
-
         ):
 
             st.session_state.authenticated = False
-
             st.session_state.username = None
 
             st.session_state.result_files = []
-
             st.session_state.result_zip = None
-
             st.session_state.result_zip_name = None
 
             st.rerun()
@@ -1410,172 +1198,56 @@ def show_main_app():
     st.divider()
 
 
-    # ========================================================
-    # INSTRUCTIONS
-    # ========================================================
-
     st.markdown(
         """
-        ### PDF COVER REPLACEMENT
+        ### AUTO PDF COVER MATCHING
 
-        將 **Word + Cover PDF** 一次全部拖入。
+        一次拖入：
 
-        命名規則：
+        - Word 文件
+        - Signed Cover PDF
 
-        ```
-        DOC-2026-00100.docx
+        Signed Cover **檔名可以任意**。
 
-        cover-DOC-2026-00100.pdf
-        ```
+        系統會讀取文件內容中的：
 
-        系統會產生：
+        `DOC-YYYY-NNNNN`
 
-        ```
-        DOC-2026-00100-Final.pdf
-        ```
+        自動尋找對應 Word。
+
+        注意：
+
+        - 每份 Signed Cover 必須只有 1 頁
+        - Word 與 Signed Cover 數量必須一致
+        - 文件編號不可重複
+        - 找不到對應文件時不會執行
         """
     )
 
 
-    # ========================================================
-    # FILE UPLOAD
-    # ========================================================
-
     uploaded_files = st.file_uploader(
-
-        "DROP WORD + COVER PDF FILES HERE",
-
+        "DROP WORD + SIGNED COVER PDF FILES HERE",
         type=[
             "doc",
             "docx",
             "pdf"
         ],
-
         accept_multiple_files=True,
     )
 
 
-    # ========================================================
-    # FILE MAPPING
-    # ========================================================
-
     if uploaded_files:
 
-        word_files = [
-
-            f
-
-            for f in uploaded_files
-
-            if Path(
-                f.name
-            ).suffix.lower()
-
-            in [
-                ".doc",
-                ".docx"
-            ]
-        ]
-
-
-        cover_files = [
-
-            f
-
-            for f in uploaded_files
-
-            if (
-
-                Path(
-                    f.name
-                ).suffix.lower()
-                == ".pdf"
-
-                and
-
-                f.name.lower().startswith(
-                    "cover-"
-                )
+        word_files, pdf_files = (
+            analyze_uploaded_files(
+                uploaded_files
             )
-        ]
-
-
-        cover_names = {
-
-            f.name.lower()
-
-            for f in cover_files
-        }
-
-
-        preview = []
-
-
-        for word in word_files:
-
-            base = Path(
-                word.name
-            ).stem
-
-
-            expected = (
-                f"cover-{base}.pdf"
-            )
-
-
-            preview.append(
-                {
-
-                    "WORD FILE":
-                    word.name,
-
-                    "EXPECTED COVER":
-                    expected,
-
-                    "STATUS":
-                    (
-                        "OK"
-
-                        if expected.lower()
-                        in cover_names
-
-                        else "MISSING"
-                    )
-                }
-            )
-
-
-        st.markdown(
-            "### FILE MAPPING"
         )
 
 
-        st.dataframe(
-
-            preview,
-
-            use_container_width=True,
-
-            hide_index=True,
+        c1, c2, c3 = st.columns(
+            3
         )
-
-
-        missing_count = sum(
-
-            1
-
-            for row in preview
-
-            if row["STATUS"]
-            == "MISSING"
-        )
-
-
-        # ====================================================
-        # METRICS
-        # ====================================================
-
-        c1, c2, c3 = st.columns(3)
 
 
         c1.metric(
@@ -1585,77 +1257,56 @@ def show_main_app():
 
 
         c2.metric(
-            "COVER",
-            len(cover_files)
+            "SIGNED COVER",
+            len(pdf_files)
+        )
+
+
+        count_ok = (
+            len(word_files)
+            == len(pdf_files)
+            and len(word_files) > 0
         )
 
 
         c3.metric(
-            "MISSING COVER",
-            missing_count
+            "COUNT CHECK",
+            (
+                "OK"
+                if count_ok
+                else "ERROR"
+            )
         )
 
 
-        # ====================================================
-        # START
-        # ====================================================
+        if not count_ok:
 
-        start_disabled = (
-
-            len(word_files) == 0
-
-            or
-
-            missing_count > 0
-        )
-
-
-        if st.button(
-
-            "START PROCESS",
-
-            type="primary",
-
-            use_container_width=True,
-
-            disabled=start_disabled,
-
-        ):
-
-            run_process(
-
-                username,
-
-                uploaded_files,
+            st.error(
+                (
+                    "Word 與 Signed Cover PDF 數量必須完全一致。"
+                    f"目前 Word = {len(word_files)}，"
+                    f"PDF = {len(pdf_files)}"
+                )
             )
 
 
-    # ========================================================
-    # DOWNLOAD
-    # ========================================================
+        if st.button(
+            "ANALYZE & START PROCESS",
+            type="primary",
+            use_container_width=True,
+            disabled=not count_ok,
+        ):
+
+            run_process(
+                uploaded_files
+            )
+
 
     show_download_results()
 
 
-    # ========================================================
-    # ADMIN
-    # ONLY DENNY
-    # ========================================================
-
-    if username == "Denny":
-
-        st.divider()
-
-
-        with st.expander(
-            "ADMIN / USAGE HISTORY"
-        ):
-
-            show_admin_dashboard()
-
-
 # ============================================================
-# APP START
+# START
 # ============================================================
 
 if not st.session_state.authenticated:
