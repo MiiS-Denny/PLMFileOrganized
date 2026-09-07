@@ -21,7 +21,7 @@ from pdf2image import convert_from_path
 # ============================================================
 
 APP_NAME = "PLM PDF Automation Tool"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 
 TAIPEI_TZ = ZoneInfo("Asia/Taipei")
 
@@ -100,7 +100,6 @@ DEFAULT_SESSION = {
 for key, value in DEFAULT_SESSION.items():
 
     if key not in st.session_state:
-
         st.session_state[key] = value
 
 
@@ -148,16 +147,10 @@ def verify_password(
 ):
 
     if username not in USER_DB:
-
         return False
 
-    expected = (
-        USER_DB[username]["password"]
-    )
-
-    entered = str(
-        password
-    ).strip()
+    expected = USER_DB[username]["password"]
+    entered = str(password).strip()
 
     return hmac.compare_digest(
         entered,
@@ -185,7 +178,6 @@ def normalize_document_number(
 ):
 
     if not text:
-
         return None
 
     text = text.upper()
@@ -213,9 +205,7 @@ def normalize_document_number(
             year = match.group(1)
             number = match.group(2)
 
-            return (
-                f"DOC-{year}-{number}"
-            )
+            return f"DOC-{year}-{number}"
 
     return None
 
@@ -257,7 +247,6 @@ def extract_pdf_text(
             )
 
         except Exception:
-
             pass
 
     return "\n".join(
@@ -283,7 +272,6 @@ def extract_pdf_text_ocr(
     )
 
     if not images:
-
         return ""
 
     image = images[0]
@@ -303,7 +291,6 @@ def extract_pdf_text_ocr(
     if normalize_document_number(
         text1
     ):
-
         return text1
 
 
@@ -857,10 +844,6 @@ def run_analysis(
     )
 
 
-    # ========================================================
-    # STORE MULTIPLE FILES PER DOC
-    # ========================================================
-
     cover_candidates = {}
     word_candidates = {}
 
@@ -881,7 +864,7 @@ def run_analysis(
 
 
         # ====================================================
-        # ANALYZE COVER
+        # ANALYZE SIGNED COVER
         # ====================================================
 
         status.write(
@@ -899,10 +882,7 @@ def run_analysis(
 
             cover_path = (
                 tmp
-                / (
-                    f"cover_"
-                    f"{index:04d}.pdf"
-                )
+                / f"cover_{index:04d}.pdf"
             )
 
 
@@ -1337,9 +1317,9 @@ def run_analysis(
         )
 
 
-        # ----------------------------------------------------
-        # Exactly one Word + one Cover = safe match
-        # ----------------------------------------------------
+        # ====================================================
+        # SAFE MATCH
+        # ====================================================
 
         if (
             len(covers) == 1
@@ -1372,9 +1352,9 @@ def run_analysis(
             )
 
 
-        # ----------------------------------------------------
-        # Missing cover
-        # ----------------------------------------------------
+        # ====================================================
+        # WORD WITHOUT COVER
+        # ====================================================
 
         elif (
             len(words) == 1
@@ -1394,9 +1374,9 @@ def run_analysis(
             )
 
 
-        # ----------------------------------------------------
-        # Missing Word
-        # ----------------------------------------------------
+        # ====================================================
+        # COVER WITHOUT WORD
+        # ====================================================
 
         elif (
             len(covers) == 1
@@ -1416,8 +1396,10 @@ def run_analysis(
             )
 
 
-        # Duplicate cases already have errors above.
-        # Add a matching ambiguity message too.
+        # ====================================================
+        # DUPLICATE / AMBIGUOUS
+        # ====================================================
+
         elif (
             len(covers) > 1
             or
@@ -1573,7 +1555,7 @@ def execute_matched_items():
             try:
 
                 # --------------------------------------------
-                # Restore Word
+                # RESTORE WORD
                 # --------------------------------------------
 
                 word_path = (
@@ -1593,7 +1575,7 @@ def execute_matched_items():
 
 
                 # --------------------------------------------
-                # Restore Cover
+                # RESTORE COVER
                 # --------------------------------------------
 
                 cover_path = (
@@ -1612,23 +1594,28 @@ def execute_matched_items():
 
 
                 # --------------------------------------------
-                # Word → PDF
+                # WORD → PDF
                 # --------------------------------------------
 
-                main_pdf = (
-                    word_to_pdf(
-                        word_path,
-                        pdf_dir
-                    )
+                main_pdf = word_to_pdf(
+                    word_path,
+                    pdf_dir
                 )
 
 
                 # --------------------------------------------
-                # Final
+                # OUTPUT NAME = ORIGINAL WORD NAME
                 # --------------------------------------------
 
+                word_stem = Path(
+                    item[
+                        "word_name"
+                    ]
+                ).stem
+
+
                 final_name = (
-                    f"{doc_no}-Final.pdf"
+                    f"{word_stem}.pdf"
                 )
 
 
@@ -1637,6 +1624,10 @@ def execute_matched_items():
                     / final_name
                 )
 
+
+                # --------------------------------------------
+                # REPLACE FIRST PAGE
+                # --------------------------------------------
 
                 replace_first_page(
                     cover_path,
@@ -1696,7 +1687,7 @@ def execute_matched_items():
 
 
     # ========================================================
-    # OUTPUT
+    # OUTPUT ZIP
     # ========================================================
 
     if result_files:
@@ -1824,7 +1815,7 @@ def show_analysis_result():
 
 
     # ========================================================
-    # MATCH TABLE
+    # MATCHED ITEMS
     # ========================================================
 
     if matches:
@@ -1839,6 +1830,16 @@ def show_analysis_result():
 
         for item in matches:
 
+            output_name = (
+                Path(
+                    item[
+                        "word_name"
+                    ]
+                ).stem
+                + ".pdf"
+            )
+
+
             matched_rows.append(
                 {
                     "DOCUMENT NO.":
@@ -1852,6 +1853,9 @@ def show_analysis_result():
 
                     "DETECTION":
                     item["cover_method"],
+
+                    "OUTPUT FILE":
+                    output_name,
 
                     "STATUS":
                     "READY",
@@ -2175,7 +2179,10 @@ def show_main_app():
 
         Signed Cover 若為掃描 PDF，會自動 OCR。
 
-        **無法配對的項目只會列為 Error，不會阻止其他已吻合項目執行。**
+        無法配對的項目只會列為 Error，
+        不會阻止其他已吻合項目執行。
+
+        **輸出 PDF 檔名會沿用原本 Word 檔名。**
         """
     )
 
