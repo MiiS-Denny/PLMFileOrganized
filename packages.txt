@@ -1,5 +1,1 @@
-libreoffice
-fonts-noto-cjk
-fonts-liberation
-tesseract-ocr
-poppler-utils
+
