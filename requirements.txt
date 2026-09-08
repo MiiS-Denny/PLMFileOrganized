@@ -1,5 +1,6 @@
 streamlit
-pypdf
-pdf2image
-pytesseract
+PyMuPDF
+python-docx
+rapidocr-onnxruntime
+onnxruntime
 Pillow
