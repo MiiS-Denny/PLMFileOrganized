@@ -164,35 +164,72 @@ def verify_password(
 
 DOC_PATTERNS = [
 
+    # ========================================================
+    # TYPE 1：DOC 文件
+    #
+    # 支援：
     # DOC-2026-00491
     # DOC 2026 00491
     # DOC_2026_00491
     # D O C - 2026 - 00491
+    # ========================================================
+    (
+        "DOC",
+        r"D\s*O\s*C\s*[-_\s:]*"
+        r"([0-9]{4})\s*[-_\s:]*"
+        r"([0-9]{4,6})"
+    ),
 
-    r"D\s*O\s*C\s*[-_\s:]*([0-9]{4})\s*[-_\s:]*([0-9]{4,6})",
+    # ========================================================
+    # TYPE 2：MiiS-H 文件
+    #
+    # 標準格式：
+    # MiiS-H-12345-02
+    #
+    # OCR / PDF Text 也允許：
+    # MIIS-H-12345-02
+    # MiiS H 12345 02
+    # M I I S - H - 12345 - 02
+    # MIIS_H_12345_02
+    #
+    # XXXXX = 5 位數
+    # XX    = 2 位數
+    # ========================================================
+    (
+        "MIIS_H",
+        r"M\s*I\s*I\s*S\s*[-_\s:]*"
+        r"H\s*[-_\s:]*"
+        r"([0-9]{5})\s*[-_\s:]*"
+        r"([0-9]{2})"
+    ),
 ]
 
 
-def normalize_document_number(
-    text
-):
+def normalize_document_number(text):
 
     if not text:
         return None
 
+    # 統一成大寫方便辨識
     text = text.upper()
 
+    # NBSP → 一般空白
     text = text.replace(
         "\u00a0",
         " "
     )
 
+    # 全形空白 → 一般空白
     text = text.replace(
         "\u3000",
         " "
     )
 
-    for pattern in DOC_PATTERNS:
+    # ========================================================
+    # 逐一檢查支援的文件編號格式
+    # ========================================================
+
+    for doc_type, pattern in DOC_PATTERNS:
 
         match = re.search(
             pattern,
@@ -200,12 +237,30 @@ def normalize_document_number(
             re.IGNORECASE
         )
 
-        if match:
+        if not match:
+            continue
+
+        # ====================================================
+        # DOC-YYYY-NNNNN
+        # ====================================================
+
+        if doc_type == "DOC":
 
             year = match.group(1)
             number = match.group(2)
 
             return f"DOC-{year}-{number}"
+
+        # ====================================================
+        # MiiS-H-XXXXX-XX
+        # ====================================================
+
+        if doc_type == "MIIS_H":
+
+            number = match.group(1)
+            revision = match.group(2)
+
+            return f"MiiS-H-{number}-{revision}"
 
     return None
 
